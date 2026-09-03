@@ -1,6 +1,6 @@
 /*
 ======================================================================
-    ZPAUSE  --  Synced co-op pause for Black Ops II Zombies
+    ZPAUSE v1.1  --  Synced co-op pause for Black Ops II Zombies
     Plutonium T6
 
     by Xep
@@ -141,6 +141,17 @@ zp_load_config()
     */
     level.zp.freeze_anims      = zp_cfg_int( "zp_freeze_anims", 1 );
     level.zp.godmode           = zp_cfg_int( "zp_godmode", 1 );
+
+    /*
+        Re-assert the player freeze while the game is held. Map scripts
+        that carry a player somewhere lock the controls for the ride and
+        call freezecontrols( 0 ) when it ends -- Ascension's lander is the
+        one that bites -- which hands control back mid-pause and lets that
+        player walk around a frozen game. Nothing can read the freeze state
+        back, so the guard simply re-applies it; it re-pins godmode and
+        ignoreme at the same time.
+    */
+    level.zp.control_guard     = zp_cfg_int( "zp_control_guard", 1 );
     level.zp.freeze_clock      = zp_cfg_int( "zp_freeze_clock", 1 );
     level.zp.freeze_powerups   = zp_cfg_int( "zp_freeze_powerups", 1 );
     level.zp.freeze_effects    = zp_cfg_int( "zp_freeze_effects", 1 );     // insta-kill / double points
@@ -149,7 +160,26 @@ zp_load_config()
     // --- presentation ----------------------------------------------
     level.zp.blackout          = zp_cfg_int( "zp_blackout", 0 );  // black out screens while paused
     level.zp.show_hint         = zp_cfg_int( "zp_show_hint", 1 ); // tell players how to pause on spawn
-    level.zp.countdown_sound   = zp_cfg_str( "zp_countdown_sound", "" );
+
+    /*
+        Softer alternative to the blackout: setblur() is the same
+        post-process the game runs when you buy a perk, which uses 4.
+        1.5 reads as "the game has stepped back" without hiding it.
+    */
+    level.zp.blur              = zp_cfg_int( "zp_blur", 1 );
+    level.zp.blur_amount       = zp_cfg_float( "zp_blur_amount", 1.5 );
+
+    /*
+        Stock aliases, so both packagings stay one drop-in file -- a
+        custom sound would have to be installed by every player rather
+        than just the host. go_inert and end_inert are what a zombie
+        plays going dormant and waking up; tombstone_timer_count is the
+        game's own once-a-second countdown tick. Set any to "" for
+        silence.
+    */
+    level.zp.pause_sound       = zp_cfg_str( "zp_pause_sound", "zmb_zombie_go_inert" );
+    level.zp.countdown_sound   = zp_cfg_str( "zp_countdown_sound", "zmb_tombstone_timer_count" );
+    level.zp.resume_sound      = zp_cfg_str( "zp_resume_sound", "zmb_zombie_end_inert" );
 
     // Drift guard tolerance, in units squared. 64 = 8 units.
     level.zp.drift_tolerance   = 64;
@@ -427,10 +457,13 @@ zp_do_pause( player )
     if ( level.zp.freeze_anims )
         level thread zp_anim_freeze_pass();
 
-    // 4. Lock the players.
+    // 4. Lock the players, and keep them locked.
     players = get_players();
     for ( i = 0; i < players.size; i++ )
         players[i] zp_freeze_player();
+
+    if ( level.zp.control_guard )
+        level thread zp_player_enforcer();
 
     // 5. Hold the clocks.
     if ( level.zp.freeze_clock )
@@ -445,6 +478,7 @@ zp_do_pause( player )
     // 6. Tell everybody.
     level thread zp_hud_show();
     zp_msg_all( "^3[Pause]^7 game paused by ^3" + level.zp_pauser_name );
+    level thread zp_sound_all( level.zp.pause_sound );
 
     if ( level.zp.max_pause_time > 0 )
         level thread zp_auto_unpause();
@@ -482,7 +516,7 @@ zp_do_unpause( player )
         if ( isdefined( level.zp_hud_sub ) )
             level.zp_hud_sub settext( "hold still" );
 
-        zp_sound_all( level.zp.countdown_sound );
+        level thread zp_sound_all( level.zp.countdown_sound );
         wait 1;
         cd = cd - 1;
     }
@@ -506,6 +540,8 @@ zp_do_unpause( player )
     players = get_players();
     for ( i = 0; i < players.size; i++ )
         players[i] zp_unfreeze_player();
+
+    level thread zp_sound_all( level.zp.resume_sound );
 
     if ( is_true( level.zp_spawn_flag_was_set ) )
     {
@@ -771,6 +807,9 @@ zp_freeze_player()
 
     if ( level.zp.blackout )
         self zp_blackout_on();
+
+    if ( level.zp.blur )
+        self zp_blur_on();
 }
 
 zp_unfreeze_player()
@@ -786,6 +825,7 @@ zp_unfreeze_player()
 
     self.zp_had_ignoreme = undefined;
     self zp_blackout_off();
+    self zp_blur_off();
 
     if ( level.zp.godmode )
         self thread zp_grace();
@@ -804,6 +844,43 @@ zp_grace()
         return;
 
     self disableinvulnerability();
+}
+
+/*
+    The players' half of zp_ai_enforcer(): everything the pause did to a
+    player, re-applied on a tick. freezecontrols() has no getter, so this
+    cannot check first -- but re-applying a flag that is already set is
+    free, and it is the only way to win against a map script that releases
+    a player mid-pause (see zp_control_guard in the config).
+
+    Keyed on zp_frozen, which zp_unfreeze_player() clears before it lets
+    go, so a tick landing during the thaw cannot re-freeze anybody.
+*/
+zp_player_enforcer()
+{
+    level endon( "zp_thaw" );
+    level endon( "end_game" );
+
+    for (;;)
+    {
+        players = get_players();
+
+        for ( i = 0; i < players.size; i++ )
+        {
+            p = players[i];
+
+            if ( !isdefined( p ) || !is_true( p.zp_frozen ) )
+                continue;
+
+            p freezecontrols( 1 );
+            p.ignoreme = 1;
+
+            if ( level.zp.godmode )
+                p enableinvulnerability();
+        }
+
+        wait 0.1;
+    }
 }
 
 zp_blackout_on()
@@ -829,6 +906,30 @@ zp_blackout_off()
 
     self.zp_black destroy();
     self.zp_black = undefined;
+}
+
+/*
+    setblur() is a post-process on the client, not a HUD element, so
+    there is nothing to destroy -- it has to be zeroed on the way out.
+    Anything else driving the blur (the low-health pain blur) is zeroed
+    with it, and re-applies itself afterwards.
+*/
+zp_blur_on()
+{
+    if ( is_true( self.zp_blurred ) || level.zp.blur_amount <= 0 )
+        return;
+
+    self.zp_blurred = 1;
+    self setblur( level.zp.blur_amount, 0.4 );
+}
+
+zp_blur_off()
+{
+    if ( !is_true( self.zp_blurred ) )
+        return;
+
+    self.zp_blurred = undefined;
+    self setblur( 0, 0.25 );
 }
 
 
@@ -1184,6 +1285,7 @@ zp_endgame_safety()
             continue;
 
         p zp_blackout_off();
+        p zp_blur_off();
 
         if ( is_true( p.zp_frozen ) )
         {

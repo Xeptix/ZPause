@@ -104,13 +104,45 @@ loads is left alone.
 | `zp_drift_guard` | `1` | Snap back any AI that still manages to move. |
 | `zp_freeze_anims` | `1` | Put zombies in a standing idle pose instead of looping their last animation. |
 | `zp_godmode` | `1` | Make players invulnerable while paused. |
+| `zp_control_guard` | `1` | Re-apply the player freeze every tick, so a map script can't hand controls back mid-pause. |
 | `zp_freeze_clock` | `1` | Hold the match timer. |
 | `zp_freeze_powerups` | `1` | Stop ground powerups timing out. |
 | `zp_freeze_effects` | `1` | Hold insta-kill / double-points countdowns. |
 | `zp_freeze_bleedout` | `1` | Stop downed players bleeding out. |
 | `zp_blackout` | `0` | Black out everyone's screen while paused (anti-scouting). |
+| `zp_blur` | `1` | Blur everyone's screen while paused. Clears when play resumes. |
+| `zp_blur_amount` | `1.5` | Blur strength. `4` is the blur the game runs when you buy a perk. |
 | `zp_show_hint` | `1` | Tell players how to pause when they spawn. |
-| `zp_countdown_sound` | `""` | Sound alias to play on each countdown tick. Empty = silent. |
+| `zp_pause_sound` | `zmb_zombie_go_inert` | Played when the game is paused. `""` = silent. |
+| `zp_countdown_sound` | `zmb_tombstone_timer_count` | Played on each countdown tick. `""` = silent. |
+| `zp_resume_sound` | `zmb_zombie_end_inert` | Played when play resumes. `""` = silent. |
+
+### Sounds
+
+All three are stock aliases, so both packagings stay a single drop-in file. A custom
+sound would have to ship as a fastfile and be installed by **every player** rather than
+just the host, so ZPause uses the game's own audio instead.
+
+The defaults are what the game itself uses them for: a zombie plays `go_inert` and
+`end_inert` when it drops dormant and wakes back up, and `zmb_tombstone_timer_count` is
+the game's own once-a-second countdown tick. Other aliases worth trying, all of them
+played by core zombies scripts and so present on every map:
+
+| Alias | What it is |
+|---|---|
+| `mpl_ui_timer_countdown` | The plain UI beep from the end-of-match clock. |
+| `zmb_tombstone_timer_out` | The sting when that timer runs out. |
+| `zmb_perks_power_on` | Power switch coming on. |
+| `zmb_cha_ching` | Points. |
+| `zmb_box_poof` | The magic box vanishing. |
+| `zmb_whoosh` | Short whoosh. |
+| `evt_perk_deny` | Buzzer. |
+
+Swap one in from the console:
+
+```bash
+zp_resume_sound zmb_perks_power_on
+```
 
 ---
 
@@ -145,6 +177,11 @@ seconds:
 - **An AI enforcer** that re-freezes anything appearing mid-pause, keeps `ignoreall`
   pinned, and snaps back any AI that drifts. It's a safety net — if the engine freeze does
   its job it never fires, so there's no jitter.
+- **A player enforcer.** Map scripts that carry a player somewhere lock the controls for
+  the ride and call `freezecontrols( 0 )` when it ends — Ascension's lander is the one
+  that bites. That release lands mid-pause and hands one player free movement around a
+  frozen game. `freezecontrols()` has no getter, so the guard re-asserts the freeze on a
+  tick rather than testing it, and re-pins godmode and `ignoreme` while it's there.
 - **The stuck-zombie watchdog.** `round_spawn_failsafe()` kills any zombie that hasn't
   moved 24 units in 30 seconds (15 on Origins and Mob of the Dead), assuming it's stuck
   outside the playspace. A paused zombie trips it every time, and the "put it back in the
@@ -182,6 +219,9 @@ so snapshots stop going out and clients drop with *Connection Interrupted*. Slow
   game's dormant-zombie pose so they don't run on the spot, but it's an idle animation
   rather than a hard freeze. A true animation freeze isn't reachable from server-side GSC,
   and the same applies to player animations.
+- **Scripted rides keep running.** Pause inside Ascension's lander and it still lands
+  and opens underneath the pause — the guard only stops it releasing your controls
+  early. Resuming hands them back normally.
 - **Scripted boss sequences** (Brutus spawn-ins, Panzers, ghosts, the Avogadro) are held
   in place, but a scripted move already underway can still finish.
 - **Not held:** magic box close timer, teleporter cooldowns, trap durations, and Easter
@@ -196,6 +236,25 @@ Tested in live co-op games, including on custom map ports.
 It's also compile-checked with **gsc-tool 1.4.10** targeting `t6`/`pc` against the stock
 script tree, and round-tripped through compile → decompile. Every external function it
 calls exists in the stock T6 script corpus.
+
+---
+
+## Changelog
+
+### v1.1
+
+- **Fixed:** a map script releasing a player's controls mid-pause — Ascension's lander
+  landing and opening — let that player roam around a paused game. New
+  `zp_control_guard`, on by default, re-applies the freeze every tick.
+- **Added:** `zp_blur`, a light screen blur while paused, on by default and adjustable
+  with `zp_blur_amount`. Softer than the existing blackout.
+- **Added:** separate `zp_pause_sound` and `zp_resume_sound` alongside the countdown
+  tick, all three defaulting to fitting stock aliases. `zp_countdown_sound` was silent
+  by default before.
+
+### v1.0
+
+- Initial release.
 
 ---
 
