@@ -30,37 +30,45 @@ combo exactly like you can, on a stock client with no scripts and no mods.
 
 ## Install
 
-Two packagings of the **same** file are included. Plutonium only lets you enable one mod
-at a time, so the script version is usually the better choice — it coexists with whatever
-mod you're running.
-
-### Script version (recommended)
-
-Drop `zpause.gsc` into your T6 storage scripts folder:
+Copy the **`Plutonium`** folder from the download into:
 
 ```
-%localappdata%\Plutonium\storage\t6\scripts\zm\zpause.gsc
+%localappdata%
 ```
 
-On newer Plutonium builds the path is under `raw`:
+It mirrors your existing `%localappdata%\Plutonium` exactly, so Windows will ask whether
+to merge — say yes. The only thing it replaces is an older `zpause.gsc`.
+
+That puts the file here:
 
 ```
 %localappdata%\Plutonium\storage\t6\raw\scripts\zm\zpause.gsc
+%localappdata%\Plutonium\storage\t6\scripts\zm\zpause.gsc
 ```
 
-If you aren't sure which your build uses, put it in both — only the one that exists will
-be read.
+Two copies, because Plutonium moved the script folder under `raw` at some point and which
+one your build reads depends on how old it is. Only the one your build looks at is ever
+read, so there's nothing to choose.
 
-### Mod version
-
-Copy the `zm_pause` folder into your mods folder:
+It also installs the mod packaging of the same file:
 
 ```
 %localappdata%\Plutonium\storage\t6\mods\zm_pause\scripts\zm\zpause.gsc
 ```
 
-Then pick **zm_pause** from the in-game Mods menu. The folder name must keep its `zm_`
-prefix or it won't show up in the zombies mod list.
+That copy does nothing unless you pick **zm_pause** from the in-game Mods menu, so having
+it there costs nothing. Use it *or* the script above, not both — and the script is usually
+the better pick, since Plutonium only enables one mod at a time, so it coexists with
+whatever else you're running while the mod version takes the slot.
+
+### Or run the installer
+
+`install.bat` in the download does the same copy for you. It lists what it's about to
+install, asks once, and copies — no deletes, no downloads, nothing else touched. Extract
+the zip first and run it from the extracted folder; running it from inside Windows' zip
+viewer won't work.
+
+It's optional. Dragging the `Plutonium` folder across yourself is identical.
 
 You don't need to restart the game to reload a script — just end the current game and
 start a new one.
@@ -426,7 +434,43 @@ calls exists in the stock T6 script corpus.
 
 ---
 
+## Ports
+
+| Game | Repo |
+|---|---|
+| Black Ops III (T7) | [ZPauseT7](https://github.com/Xeptix/ZPauseT7) |
+| Black Ops II (T6) | ZPause — you are here |
+| Black Ops (T5) | [ZPauseT5](https://github.com/Xeptix/ZPauseT5) |
+| World at War (T4) | [ZPauseT4](https://github.com/Xeptix/ZPauseT4) |
+
+Versions are kept in step: the same version number means the same feature set, allowing
+for what each engine can actually do. Neither older port has chat commands — those
+engines have no `say` callback — and both do the AI freeze entirely in script, since
+`disablezombies()` is a Black Ops II builtin.
+
+**All three in one download.** The
+[Treyarch Bundle](https://github.com/Xeptix/ZPause/releases/latest) is laid out in
+Plutonium's storage folder structure — drop it into `%localappdata%\Plutonium`, say yes to
+the merge, and it installs whichever of the three games you have. Delete the folders for
+the ones you don't.
+
+---
+
 ## Changelog
+
+### v1.3
+
+- **Drop-in install.** The download is now laid out as a `Plutonium` folder that mirrors
+  `%localappdata%\Plutonium`, so the whole thing goes in and merges rather than being
+  placed file by file. Both script paths are included, so there is no longer a build
+  version to work out first.
+- **MIT license** added, and it ships with the mod.
+- README updates, including cross-links to the Black Ops, World at War and Black Ops III
+  ports.
+- **A build stamp** that draws the version and build time on screen — in development
+  builds only. A released build carries an empty stamp and draws nothing.
+
+Nothing else in the script changed: v1.2 and v1.3 play identically.
 
 ### v1.2
 
@@ -512,3 +556,13 @@ calls exists in the stock T6 script corpus.
 - **[DED2SIN](https://forum.plutonium.pw/topic/46084/i-improved-a-zombies-custom-games-pause-mod)** — Plutonium pause script building on it
 - **[MufaDOOM](https://github.com/MufaDOOM/Call-Of-Duty-Black-Ops-2-Zombie-COOP-PAUSE-by-MufaDOOM)** — BO2 co-op pause mod
 - **[Resxt](https://github.com/Resxt/Plutonium-T6-Scripts)** — Plutonium T6 chat command conventions
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, fork it, ship it in a server pack. Keep the
+copyright notice and the header block at the top of `zpause.gsc`.
+
+That covers ZPause's own code. Treyarch's stock scripts are referenced here, not
+included, and are not mine to license.
