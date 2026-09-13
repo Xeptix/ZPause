@@ -1,6 +1,6 @@
 /*
 ======================================================================
-    ZPAUSE v1.3  --  Synced co-op pause for Black Ops II Zombies
+    ZPAUSE v1.4  --  Synced co-op pause for Black Ops II Zombies
     Plutonium T6
 
     by Xep
@@ -80,14 +80,26 @@ init()
     if ( is_true( level.zp_loaded ) )
         return;
 
-    level.zp_loaded = 1;
-
+    /*
+        Config first, and the flag after: zp_only_script and zp_only_mod
+        are read from it, and a copy that is not the one being asked for
+        has to leave level.zp_loaded alone so the other one can still take
+        it.
+    */
     zp_load_config();
+
+    if ( !zp_origin_wanted() )
+        return;
+
+    level.zp_loaded = 1;
 
     level.zp_paused = 0;
     level.zp_busy = 0;
     level.zp_last_toggle = 0;
     level.zp_pause_start = 0;
+    level.zp_pause_count = 0;
+    level.zp_pending = 0;
+    level.zp_pending_by = undefined;
     level.zp_spawn_flag_was_set = 0;
     level.zp_held_vars = [];
     level.zp_pauser_name = "someone";
@@ -101,6 +113,7 @@ init()
     level.zp_vote_active = 0;
     level.zp_vote_serial = 0;
     level.zp_vote_kind = "pause";
+    level.zp_vote_approval = 0;
     level.zp_vote_end_time = 0;
     level.zp_vote_last_fail = 0;
     level.zp_vote_provisional = 0;
@@ -116,6 +129,9 @@ init()
     level thread zp_connect_watcher();
     level thread zp_chat_listener();
     level thread zp_endgame_safety();
+    level thread zp_round_watcher();
+    level thread zp_config_watcher();
+    level thread zp_config_printer();
     level thread zp_build_watermark();
 }
 
@@ -133,6 +149,41 @@ main()
     do not have to edit this file.
    ================================================================== */
 
+/*
+    Which copy of the script this is: "script" for the two loose paths
+    Plutonium reads, "mod" for the copy inside mods\zm_pause.
+
+    With the mod selected both reach init(), and the first one there wins.
+    zp_only_script and zp_only_mod pick the winner instead, which is worth
+    having only while testing one against the other.
+
+    Written by mk_t6_mod.py when it generates the mod copy, the same way
+    build.py writes the version stamp. Never edit it by hand.
+*/
+zp_origin()
+{
+    // ZP_ORIGIN_BEGIN
+    return "script";
+    // ZP_ORIGIN_END
+}
+
+/*
+    Whether this copy is the one that was asked for. Neither setting on --
+    which is the default -- means whichever loads first, as before.
+*/
+zp_origin_wanted()
+{
+    origin = zp_origin();
+
+    if ( level.zp.only_script && origin != "script" )
+        return 0;
+
+    if ( level.zp.only_mod && origin != "mod" )
+        return 0;
+
+    return 1;
+}
+
 zp_load_config()
 {
     /*
@@ -147,11 +198,55 @@ zp_load_config()
         level.zp = spawnstruct();
 
     // --- input -----------------------------------------------------
+
+    // --- debug -----------------------------------------------------
+    /*
+        Which copy of the script runs when more than one is installed --
+        the loose ones Plutonium reads, or the copy in mods\zm_pause.
+        Both off is whichever gets there first, which is the normal case.
+
+        For testing one against the other. Setting both leaves nothing
+        running at all.
+        Read once, when the script loads: init() runs a single time per
+        game, so changing either of these mid-match cannot move which copy
+        is already running. End the game and start a new one. Re-running
+        init() on a live match would mean tearing down threads, HUD and any
+        held state, which is not worth it for a debug switch.
+    */
+    level.zp.only_script = zp_cfg_int( "zp_only_script", 0 );
+    level.zp.only_mod    = zp_cfg_int( "zp_only_mod", 0 );
+
+    /*
+        Only the host may pause. With this on the script behaves as though
+        the host is the only player in the game: nobody else can start or
+        end a pause, and a pause never goes to a vote, because there is no
+        one left to ask.
+
+        The host is the player in the first slot. On a dedicated server
+        nobody is really the host, and it falls to whoever holds it.
+    */
+    level.zp.host_only = zp_cfg_int( "zp_host_only", 0 );
     // Chat words that toggle the pause. "!p" is the short form.
     level.zp.allow_short_words = zp_cfg_int( "zp_allow_short_words", 0 );
 
-    // Hold crouch/prone + melee together to toggle the pause.
+    // Hold two buttons together to toggle the pause.
     level.zp.button_combo      = zp_cfg_int( "zp_button_combo", 1 );
+
+    /*
+        Which combo does it. Defaults to crouch + melee, the same as every
+        other port.
+
+            crouch_melee | crouch_use | crouch_frag | crouch_ads
+            jump_melee | use_frag | frag_only | use_ads | use_attack
+            attack_ads
+
+        A different list from T5 and T4, which read getstance() where this
+        engine has stancebuttonpressed() -- so the two do not offer the
+        same combos even though the dvar, the default and the meaning are
+        the same. zp_combo_pressed() below is the whole vocabulary; a name
+        it does not know falls through to jump + melee.
+    */
+    level.zp.combo             = zp_cfg_str( "zp_combo", "crouch_melee" );
     level.zp.button_hold_time  = zp_cfg_float( "zp_button_hold_time", 0.3 );
 
     /*
@@ -171,6 +266,45 @@ zp_load_config()
     level.zp.input_debug        = zp_cfg_int( "zp_input_debug", 0 );
 
     // --- voting ----------------------------------------------------
+
+    /*
+        Resuming waits for the players to say they are back, rather than
+        the first one to press the button deciding for everybody. Off by
+        default.
+
+        Not a vote, and not built on one: nobody votes no, it cannot fail
+        and it has no clock. It waits. That is why it does not need zp_vote
+        turned on, and why it wins over zp_vote_unpause where both are set.
+        zp_max_pause_time is what ends a pause nobody ever answers.
+    */
+    level.zp.ready_check = zp_cfg_int( "zp_ready_check", 0 );
+
+    /*
+        How much of the room has to be ready. 100 is everybody, which is
+        the point of it; lower it where one person going quiet should not
+        be able to hold the rest.
+    */
+    level.zp.ready_percent = zp_cfg_int( "zp_ready_percent", 100 );
+
+    /*
+        The host pauses at once; anybody else has to ask, and the host
+        answers yes or no. Off by default.
+
+        It is a vote with an electorate of one, and reuses the whole of
+        one: the same yes/no combos, the same HUD, the same clock and the
+        same timeout -- which is also what makes it work on the engines
+        with no chat. Narrowing eligibility to the host is what stops the
+        asker's own automatic yes from carrying it.
+
+        Pausing only. A resume still follows zp_vote and zp_vote_unpause:
+        needing the host's permission to un-pause would strand everybody
+        if the host put the controller down, which is the opposite of what
+        this is for.
+
+        zp_host_only wins where both are set -- it turns the request away
+        before there is anything to approve.
+    */
+    level.zp.host_approve = zp_cfg_int( "zp_host_approve", 0 );
     /*
         Off by default: without it any player pauses on their own, which
         is what ZPause has always done. Turn it on and a pause has to
@@ -225,7 +359,55 @@ zp_load_config()
     level.zp.vote_no_combo      = zp_cfg_str( "zp_vote_no_combo", "jump_melee" );
 
     // --- timing ----------------------------------------------------
+
+    /*
+        Hold a pause until the round is over instead of freezing the game
+        mid-horde. Asking again while one is pending calls it off.
+
+        Off by default: it takes "pause now" away, and that is often
+        exactly why somebody is reaching for the button.
+    */
+    level.zp.round_pause = zp_cfg_int( "zp_round_pause", 0 );
+
+    /*
+        A cap on how many times one match can be paused, for a server where
+        that would otherwise become an argument. 0 is no cap.
+
+        Only a pause somebody asked for spends one: an automatic pause is
+        not theirs to spend.
+    */
+    level.zp.max_pauses = zp_cfg_int( "zp_max_pauses", 0 );
+
+    /*
+        Pause when somebody drops. A crash or a dropped connection
+        otherwise leaves whoever is left to be overrun, and on these
+        clients the player can come back.
+
+        Nothing here un-pauses on its own, so zp_max_pause_time is the
+        way out when they do not come back.
+    */
+    level.zp.pause_on_disconnect = zp_cfg_int( "zp_pause_on_disconnect", 0 );
     level.zp.countdown         = zp_cfg_int( "zp_countdown", 3 );   // 3..2..1 before play resumes
+
+    /*
+        Ease time down into the pause and back out of it, rather than
+        cutting to a stop. Treyarch's own presentation for a world pause,
+        and the same lerp _killcam.gsc uses going into a kill cam.
+
+        This is NOT the timescale trap the README warns about. Two things
+        make it safe where "timescale 0" is not:
+
+            - The scale never reaches zero, so script waits keep running
+              and the unpause loop can never be frozen with it.
+            - Time is snapped back to normal the moment the world is
+              actually frozen. Nothing is moving by then, so the snap is
+              invisible, and the server spends only zp_ease_time at a
+              reduced rate rather than the whole pause.
+
+        Set zp_ease 0 for a hard cut.
+    */
+    level.zp.ease              = zp_cfg_int( "zp_ease", 1 );
+    level.zp.ease_time         = zp_cfg_float( "zp_ease_time", 0.35 );
     level.zp.grace             = zp_cfg_float( "zp_grace", 2 );     // seconds of invuln after resuming
     level.zp.cooldown          = zp_cfg_float( "zp_cooldown", 2 );  // min seconds between toggles
     level.zp.max_pause_time    = zp_cfg_int( "zp_max_pause_time", 0 ); // 0 = unlimited
@@ -281,7 +463,25 @@ zp_load_config()
     level.zp.freeze_bleedout   = zp_cfg_int( "zp_freeze_bleedout", 1 );
 
     // --- presentation ----------------------------------------------
-    level.zp.blackout          = zp_cfg_int( "zp_blackout", 0 );  // black out screens while paused
+
+    /*
+        Draw the pause block at all. Off leaves everything else working --
+        the freeze, the vote, the chat replies -- with nothing on screen,
+        which is what a recording or a server drawing its own overlay
+        wants.
+
+        The vote HUD is separate and keeps drawing, because a vote nobody
+        can see is a vote nobody can answer.
+    */
+    level.zp.hud               = zp_cfg_int( "zp_hud", 1 );
+    level.zp.blackout          = zp_cfg_int( "zp_blackout", 1 );
+
+    /*
+        How dark it goes. 1 is fully black; lower leaves the screen
+        readable, for when the point is to discourage scouting rather than
+        to make it impossible.
+    */
+    level.zp.blackout_alpha = zp_cfg_float( "zp_blackout_alpha", 0.2 );  // black out screens while paused
     level.zp.show_hint         = zp_cfg_int( "zp_show_hint", 1 ); // tell players how to pause on spawn
 
     /*
@@ -336,7 +536,7 @@ zp_load_config()
         1.5 reads as "the game has stepped back" without hiding it.
     */
     level.zp.blur              = zp_cfg_int( "zp_blur", 1 );
-    level.zp.blur_amount       = zp_cfg_float( "zp_blur_amount", 1.5 );
+    level.zp.blur_amount       = zp_cfg_float( "zp_blur_amount", 2 );
 
     /*
         Stock aliases, so both packagings stay one drop-in file -- a
@@ -363,17 +563,17 @@ zp_load_config()
 */
 zp_cfg_int( dvar, def )
 {
-    return int( set_dvar_if_unset( dvar, "" + def ) );
+    return int( zp_cfg_echo( dvar, set_dvar_if_unset( dvar, "" + def ), def ) );
 }
 
 zp_cfg_float( dvar, def )
 {
-    return float( set_dvar_if_unset( dvar, "" + def ) );
+    return float( zp_cfg_echo( dvar, set_dvar_if_unset( dvar, "" + def ), def ) );
 }
 
 zp_cfg_str( dvar, def )
 {
-    return set_dvar_if_unset( dvar, def );
+    return zp_cfg_echo( dvar, set_dvar_if_unset( dvar, def ), def );
 }
 
 
@@ -509,7 +709,7 @@ zp_is_no_word( msg )
 
 
 /* ==================================================================
-    INPUT -- BUTTON COMBO (crouch/prone + melee)
+    INPUT -- BUTTON COMBO (crouch/prone + melee by default)
 
     freezecontrols() blocks movement and weapon use but the button state
     still reaches the server, so this keeps working while paused. That is
@@ -682,7 +882,7 @@ zp_button_watcher()
         if ( !level.zp.button_combo )
             continue;
 
-        combo = self zp_active_combo( "crouch_melee", level.zp.button_combo_dead );
+        combo = self zp_active_combo( level.zp.combo, level.zp.button_combo_dead );
 
         if ( !( self zp_combo_pressed( combo ) ) )
             continue;
@@ -846,6 +1046,236 @@ zp_on_cooldown()
     return gettime() - level.zp_last_toggle < level.zp.cooldown * 1000;
 }
 
+/*
+    The host, or undefined when nobody holds the first player slot.
+
+    Entity number 0 is the test: that is what stock get_host() looks for on
+    the engines that ship it, and it is the one check all four share.
+    isHost() exists on some of them, but on Black Ops it is an MP-only name
+    that a zombies script cannot reach -- audit.py catches that -- and
+    Black Ops II has no get_host() at all.
+*/
+zp_host_player()
+{
+    players = get_players();
+
+    for ( i = 0; i < players.size; i++ )
+    {
+        if ( isdefined( players[i] ) && players[i] getentitynumber() == 0 )
+            return players[i];
+    }
+
+    return undefined;
+}
+
+/*
+    True when zp_host_only should turn this request away. Says so once
+    rather than failing silently, since a combo that does nothing reads as
+    a broken mod.
+*/
+zp_host_blocked( player )
+{
+    if ( !level.zp.host_only )
+        return 0;
+
+    host = zp_host_player();
+
+    // Nobody is the host, so there is nothing to restrict to.
+    if ( !isdefined( host ) )
+        return 0;
+
+    if ( isdefined( player ) && player == host )
+        return 0;
+
+    if ( isdefined( player ) )
+        player iprintln( "^1[Pause]^7 only the host can pause" );
+
+    return 1;
+}
+
+/*
+    Whether this match has spent its zp_max_pauses.
+*/
+zp_pauses_spent()
+{
+    return level.zp.max_pauses > 0 && level.zp_pause_count >= level.zp.max_pauses;
+}
+
+/*
+    Somebody dropping mid-round leaves the rest of the team to be overrun,
+    and on these clients they can come back -- so hold the game while they
+    do.
+
+    Threaded per player and deliberately outside zp_player_think(), which
+    carries endon( "disconnect" ): the whole job of this one is to still be
+    running after that has fired.
+*/
+zp_disconnect_watcher()
+{
+    level endon( "end_game" );
+
+    self waittill( "disconnect" );
+
+    // Read fresh: this waits for the whole match before it decides.
+    zp_load_config();
+
+    if ( !level.zp.pause_on_disconnect )
+        return;
+
+    if ( is_true( level.zp_paused ) || is_true( level.zp_busy ) || !zp_game_ready() )
+        return;
+
+    players = get_players();
+
+    // Nobody left to start it again.
+    if ( players.size < 1 )
+        return;
+
+    zp_msg_all( "^3[Pause]^7 somebody dropped -- paused" );
+    level.zp_last_toggle = gettime();
+    level thread zp_do_pause( undefined );
+}
+
+zp_ready_show( have, needed )
+{
+    // The sub-line is the natural place: it is otherwise telling people to
+    // hold a combo to resume, which is not what the combo does right now.
+    if ( have < 1 && needed < 1 )
+    {
+        level.zp_hud_sub_override = undefined;
+        return;
+    }
+
+    level.zp_hud_sub_override = "READY  " + have + " / " + needed;
+}
+
+/*
+    The last step of a pause request, once whatever had to agree has agreed.
+    Either it happens now, or it waits for the round to be over.
+
+    Both the direct path and a vote that passed come through here. A player
+    dropping does not: that calls zp_do_pause() itself, since waiting for
+    the round to end is the opposite of what is wanted there.
+*/
+zp_begin_pause( player )
+{
+    if ( !level.zp.round_pause )
+    {
+        level thread zp_do_pause( player );
+        return;
+    }
+
+    level.zp_pending = 1;
+    level.zp_pending_by = player;
+
+    zp_msg_all( "^3[Pause]^7 pausing at the end of the round -- ask again to call it off" );
+}
+
+/*
+    Fires the held pause at the round boundary.
+*/
+zp_round_watcher()
+{
+    level endon( "end_game" );
+
+    for (;;)
+    {
+        level waittill( "end_of_round" );
+
+        if ( !is_true( level.zp_pending ) )
+            continue;
+
+        level.zp_pending = 0;
+        by = level.zp_pending_by;
+        level.zp_pending_by = undefined;
+
+        zp_load_config();
+
+        if ( is_true( level.zp_paused ) || is_true( level.zp_busy ) || !zp_game_ready() )
+            continue;
+
+        level.zp_last_toggle = gettime();
+        level thread zp_do_pause( by );
+    }
+}
+
+zp_ready_clear()
+{
+    players = get_players();
+
+    for ( i = 0; i < players.size; i++ )
+    {
+        if ( isdefined( players[i] ) )
+            players[i].zp_ready = undefined;
+    }
+
+    zp_ready_show( 0, 0 );
+}
+
+zp_ready_count()
+{
+    players = get_players();
+    c = 0;
+
+    for ( i = 0; i < players.size; i++ )
+    {
+        if ( isdefined( players[i] ) && is_true( players[i].zp_ready ) )
+            c++;
+    }
+
+    return c;
+}
+
+zp_ready_needed()
+{
+    players = get_players();
+    n = players.size;
+
+    if ( n < 1 )
+        return 1;
+
+    needed = int( ceil( n * level.zp.ready_percent / 100 ) );
+
+    // Never ask for more people than are here to answer.
+    if ( needed > n )
+        needed = n;
+
+    if ( needed < 1 )
+        needed = 1;
+
+    return needed;
+}
+
+/*
+    Somebody saying they are back. The resume input marks instead of
+    resuming while zp_ready_check is on, so the last one to press it is
+    what starts the game again.
+*/
+zp_mark_ready( player )
+{
+    if ( isdefined( player ) )
+    {
+        if ( is_true( player.zp_ready ) )
+            return;
+
+        player.zp_ready = 1;
+        player iprintln( "^2[Pause]^7 you are ready" );
+    }
+
+    needed = zp_ready_needed();
+    have = zp_ready_count();
+
+    if ( have < needed )
+    {
+        zp_ready_show( have, needed );
+        return;
+    }
+
+    zp_ready_show( 0, 0 );
+    level.zp_last_toggle = gettime();
+    level thread zp_do_unpause( player, "everyone ready" );
+}
+
 zp_request_toggle( player )
 {
     if ( is_true( level.zp_paused ) )
@@ -856,6 +1286,15 @@ zp_request_toggle( player )
 
 zp_request_pause( player )
 {
+    /*
+        Loaded here as well as below so turning zp_host_only on takes
+        effect on the next attempt rather than the one after it.
+    */
+    zp_load_config();
+
+    if ( zp_host_blocked( player ) )
+        return;
+
     if ( is_true( level.zp_busy ) || is_true( level.zp_paused ) )
         return;
 
@@ -874,6 +1313,26 @@ zp_request_pause( player )
         return;
     }
 
+    /*
+        A second ask calls off a pause that is waiting for the round to end,
+        so the same input both sets it and takes it back.
+    */
+    if ( is_true( level.zp_pending ) )
+    {
+        level.zp_pending = 0;
+        level.zp_pending_by = undefined;
+        zp_msg_all( "^3[Pause]^7 the pause at the end of the round is off" );
+        return;
+    }
+
+    if ( zp_pauses_spent() )
+    {
+        if ( isdefined( player ) )
+            player iprintln( "^1[Pause]^7 no pauses left this match" );
+
+        return;
+    }
+
     if ( zp_on_cooldown() )
         return;
 
@@ -881,7 +1340,7 @@ zp_request_pause( player )
     // turning zp_vote on mid-game does not have to pause once first.
     zp_load_config();
 
-    if ( level.zp.vote && !zp_vote_is_moot( player ) )
+    if ( zp_vote_wanted( player ) )
     {
         if ( zp_vote_locked_out() )
         {
@@ -897,11 +1356,20 @@ zp_request_pause( player )
     }
 
     level.zp_last_toggle = gettime();
-    level thread zp_do_pause( player );
+    zp_begin_pause( player );
 }
 
 zp_request_unpause( player )
 {
+    /*
+        Loaded here as well as below so turning zp_host_only on takes
+        effect on the next attempt rather than the one after it.
+    */
+    zp_load_config();
+
+    if ( zp_host_blocked( player ) )
+        return;
+
     if ( is_true( level.zp_busy ) || !is_true( level.zp_paused ) )
         return;
 
@@ -922,6 +1390,12 @@ zp_request_unpause( player )
         return;
 
     zp_load_config();
+
+    if ( level.zp.ready_check )
+    {
+        zp_mark_ready( player );
+        return;
+    }
 
     if ( level.zp.vote && level.zp.vote_unpause && !zp_vote_is_moot( player ) )
     {
@@ -947,6 +1421,58 @@ zp_request_unpause( player )
     PAUSE
    ================================================================== */
 
+/*
+    A quarter speed. Slow enough to read as deliberate, far enough from
+    zero that a script wait during the ramp still completes promptly.
+*/
+zp_ease_scale()
+{
+    return 0.25;
+}
+
+zp_ease_in()
+{
+    if ( !level.zp.ease || level.zp.ease_time <= 0 )
+        return;
+
+    setslowmotion( 1, zp_ease_scale(), level.zp.ease_time );
+    wait( level.zp.ease_time );
+}
+
+/*
+    Called once the world is held. Nothing is moving, so putting time back
+    to normal here cannot be seen -- and it means the pause itself runs at
+    ordinary speed however long it lasts.
+*/
+zp_ease_settle()
+{
+    if ( !level.zp.ease || level.zp.ease_time <= 0 )
+        return;
+
+    setslowmotion( zp_ease_scale(), 1, 0 );
+}
+
+/*
+    The mirror: drop to the eased rate while everything is still held --
+    invisible, same as the settle -- so that releasing the world ramps up
+    from slow instead of starting at full speed.
+*/
+zp_ease_out()
+{
+    if ( !level.zp.ease || level.zp.ease_time <= 0 )
+        return;
+
+    setslowmotion( 1, zp_ease_scale(), 0 );
+}
+
+zp_ease_release()
+{
+    if ( !level.zp.ease || level.zp.ease_time <= 0 )
+        return;
+
+    setslowmotion( zp_ease_scale(), 1, level.zp.ease_time );
+}
+
 zp_do_pause( player )
 {
     // Pick up any dvar the host changed since the last pause, so config
@@ -962,7 +1488,21 @@ zp_do_pause( player )
     if ( isdefined( player ) && isdefined( player.name ) )
         level.zp_pauser_name = player.name;
 
+    /*
+        Only a pause somebody asked for counts against zp_max_pauses. An
+        automatic one -- a player dropping -- is not theirs to spend.
+    */
+    if ( isdefined( player ) )
+        level.zp_pause_count = level.zp_pause_count + 1;
+
+    zp_ready_clear();
+
     level notify( "zp_paused" );
+
+    // 0. Ease time down, so the stop reads as deliberate rather than as a
+    //    hitch. Time is put back at the end of this function, once
+    //    everything is held and the change cannot be seen.
+    zp_ease_in();
 
     // 1. Close the spawner gate. This is the flag _zm.gsc's spawn loop
     //    blocks on, and the same one host migration clears.
@@ -1011,6 +1551,9 @@ zp_do_pause( player )
     if ( level.zp.max_pause_time > 0 )
         level thread zp_auto_unpause();
 
+    // Everything is held now, so normal time is invisible from here.
+    zp_ease_settle();
+
     level.zp_busy = 0;
 }
 
@@ -1054,6 +1597,10 @@ zp_do_unpause( player, label )
         cd = cd - 1;
     }
 
+    // Drop to the eased rate before anything moves, so the world starts
+    // slow and ramps up rather than snapping to full speed.
+    zp_ease_out();
+
     // Stop every enforcer thread at once, then reverse the pause.
     level notify( "zp_thaw" );
 
@@ -1075,6 +1622,7 @@ zp_do_unpause( player, label )
         players[i] zp_unfreeze_player();
 
     level thread zp_sound_all( level.zp.resume_sound );
+    zp_ease_release();
 
     if ( is_true( level.zp_spawn_flag_was_set ) )
     {
@@ -1314,6 +1862,7 @@ zp_player_think()
         return;
 
     self.zp_thinking = 1;
+    self thread zp_disconnect_watcher();
     self thread zp_button_watcher();
     self thread zp_vote_no_watcher();
     self thread zp_input_debug_watcher();
@@ -1341,7 +1890,7 @@ zp_hint()
     wait 8;
 
     if ( level.zp.button_combo )
-        self iprintln( "^3[Pause]^7 type ^3!pause^7 or hold ^3crouch + melee" );
+        self iprintln( "^3[Pause]^7 type ^3!pause^7 or hold ^3" + zp_combo_label( level.zp.combo ) );
     else
         self iprintln( "^3[Pause]^7 type ^3!pause^7 to pause or resume" );
 
@@ -1453,7 +2002,7 @@ zp_blackout_on()
     self.zp_black setshader( "black", 640, 480 );
     self.zp_black.alpha = 0;
     self.zp_black fadeovertime( 0.4 );
-    self.zp_black.alpha = 0.92;
+    self.zp_black.alpha = level.zp.blackout_alpha;
 }
 
 zp_blackout_off()
@@ -1969,6 +2518,9 @@ zp_pause_yoff( line )
 
 zp_hud_show()
 {
+    if ( !level.zp.hud )
+        return;
+
     zp_hud_destroy();
 
     level.zp_hud = createserverfontstring( "objective", 1.9 );
@@ -2042,7 +2594,7 @@ zp_pause_hint_text( player )
     if ( !level.zp.button_combo )
         return "type !unpause to resume";
 
-    combo = "crouch_melee";
+    combo = level.zp.combo;
 
     if ( isdefined( player ) && zp_player_input_limited( player ) )
         combo = level.zp.button_combo_dead;
@@ -2267,10 +2819,44 @@ zp_sound_all( alias )
     is alive and can still vote from chat; only someone bled out and
     spectating drops out of the electorate, and only with vote_alive_only.
 */
+/*
+    Approval mode, and somebody is actually holding the host slot. With no
+    host there is nobody to ask, so it stays out of the way rather than
+    opening a request that nothing can answer.
+*/
+zp_host_approving()
+{
+    return level.zp.host_approve && isdefined( zp_host_player() );
+}
+
+zp_player_is_host( player )
+{
+    host = zp_host_player();
+
+    return isdefined( host ) && isdefined( player ) && player == host;
+}
+
+/*
+    Whether a pause has to be put to somebody rather than simply done. In
+    approval mode everybody but the host is put to the host, whatever
+    zp_vote says, and the host's own pause never waits on anyone.
+*/
+zp_vote_wanted( player )
+{
+    if ( zp_host_approving() )
+        return !zp_player_is_host( player );
+
+    return level.zp.vote && !zp_vote_is_moot( player );
+}
+
 zp_vote_eligible( player )
 {
     if ( !isdefined( player ) )
         return 0;
+
+    // An approval is a vote of one. See zp_host_approve.
+    if ( is_true( level.zp_vote_approval ) )
+        return zp_player_is_host( player );
 
     if ( !level.zp.vote_alive_only )
         return 1;
@@ -2321,6 +2907,13 @@ zp_vote_needed()
 */
 zp_vote_is_moot( player )
 {
+    /*
+        With zp_host_only on the host is the only player who can act on a
+        pause, so there is nobody to put it to.
+    */
+    if ( level.zp.host_only && isdefined( zp_host_player() ) )
+        return 1;
+
     if ( !level.zp.vote_initiator_yes )
         return 0;
 
@@ -2391,6 +2984,16 @@ zp_vote_start( player, kind )
     level.zp_vote_serial = level.zp_vote_serial + 1;
     level.zp_vote_active = 1;
     level.zp_vote_kind = kind;
+
+    /*
+        Recorded on the vote rather than read from the dvar while it runs,
+        so an ordinary vote opened later cannot inherit an electorate of
+        one. Cleared again in zp_vote_stop().
+    */
+    level.zp_vote_approval = 0;
+
+    if ( kind == "pause" && zp_host_approving() && !zp_player_is_host( player ) )
+        level.zp_vote_approval = 1;
     level.zp_vote_end_time = gettime() + int( level.zp.vote_time * 1000 );
     level.zp_vote_initiator = player;
     level.zp_vote_provisional = 0;
@@ -2417,7 +3020,10 @@ zp_vote_start( player, kind )
     if ( kind == "unpause" )
         verb = "resume";
 
-    zp_msg_all( "^3[Pause]^7 ^3" + level.zp_vote_name + "^7 called a vote to " + verb );
+    if ( is_true( level.zp_vote_approval ) )
+        zp_msg_all( "^3[Pause]^7 ^3" + level.zp_vote_name + "^7 is asking the host to pause" );
+    else
+        zp_msg_all( "^3[Pause]^7 ^3" + level.zp_vote_name + "^7 called a vote to " + verb );
 
     // The HUD spells out how to vote; only repeat it in chat without one.
     if ( !level.zp.vote_hud )
@@ -2506,7 +3112,7 @@ zp_vote_finish( passed, yes, needed )
         else if ( !is_true( level.zp_paused ) )
         {
             level.zp_last_toggle = gettime();
-            level thread zp_do_pause( initiator );
+            zp_begin_pause( initiator );
         }
         else
         {
@@ -2539,6 +3145,7 @@ zp_vote_finish( passed, yes, needed )
 
 zp_vote_stop( keep_title )
 {
+    level.zp_vote_approval = 0;
     level.zp_vote_serial = level.zp_vote_serial + 1;
     level.zp_vote_active = 0;
     level.zp_vote_provisional = 0;
@@ -2628,10 +3235,14 @@ zp_hud_text( elem, txt )
 */
 zp_vote_hint_text( player, binds )
 {
+    // Only the host can answer an approval, so nobody else is told how.
+    if ( is_true( level.zp_vote_approval ) && !zp_player_is_host( player ) )
+        return "waiting for the host";
+
     if ( !level.zp.button_combo )
         return "^2!yes^7     ^1!no";
 
-    yes_combo = "crouch_melee";
+    yes_combo = level.zp.combo;
     no_combo = level.zp.vote_no_combo;
 
     // Down on the floor or spectating: show the combo that still works
@@ -2703,7 +3314,9 @@ zp_vote_hud_update( yes, needed, secs )
         level.zp_vote_clock settimer( secs );
     }
 
-    if ( level.zp_vote_kind == "unpause" )
+    if ( is_true( level.zp_vote_approval ) )
+        title = "PAUSE REQUEST";
+    else if ( level.zp_vote_kind == "unpause" )
         title = "RESUME VOTE   ^2" + yes + "^7 / " + needed;
     else
         title = "PAUSE VOTE   ^2" + yes + "^7 / " + needed;
@@ -2864,6 +3477,124 @@ zp_build()
     // ZP_BUILD_END
 }
 
+/*
+    Hands the value straight back, so it can wrap a return. Silent unless
+    zp_config_printer() has the echo on.
+*/
+zp_cfg_echo( dvar, value, def )
+{
+    if ( !is_true( level.zp_cfg_echo ) )
+        return value;
+
+    println( "  " + dvar + "  " + value );
+
+    // On screen, only what somebody actually changed. All fifty would
+    // scroll off, and the defaults are in the README.
+    if ( isdefined( level.zp_cfg_host ) && value != ( "" + def ) )
+        level.zp_cfg_host iprintln( "^3" + dvar + "^7  " + value );
+
+    return value;
+}
+
+/*
+    "set zp_config_print 1" in the console prints every setting and the
+    value it is currently holding.
+
+    Black Ops III completes the dvars its engine registered and not the
+    ones a script creates, so the zp_ names never show up in its console
+    suggestions and there is no GSC call that would add them. This is the
+    part that is in reach, and it is worth having on every port.
+
+    The echo rides on zp_cfg_int/float/str rather than a list kept here,
+    so a setting added later prints without anyone having to remember it.
+*/
+/*
+    Picks up a dvar changed mid-game.
+
+    zp_load_config() runs on every pause request already, so pausing has
+    always used current settings. This is for the ones the input watchers
+    read continuously -- zp_combo above all, which could not be changed by
+    hand at all where there is no chat command, because changing it needed
+    a pause and the combo is what asks for one.
+
+    Not while paused or busy: the HUD is built from these when the pause
+    starts and nothing rebuilds it in place, so moving them underneath
+    would leave elements where the old values put them. It lands as soon
+    as play resumes.
+
+    A few dozen dvar reads every five seconds, and no writes once they all
+    exist. The tick is only for a setting changed by hand mid-game --
+    pausing and resuming both re-read the config themselves, so neither
+    ever waits on it.
+*/
+zp_config_watcher()
+{
+    level endon( "end_game" );
+
+    for (;;)
+    {
+        wait 5;
+
+        if ( is_true( level.zp_paused ) || is_true( level.zp_busy ) )
+            continue;
+
+        zp_load_config();
+    }
+}
+
+zp_config_printer()
+{
+    level endon( "end_game" );
+
+    // Create it, so there is something to set.
+    if ( getdvar( "zp_config_print" ) == "" )
+        setdvar( "zp_config_print", "0" );
+
+    for ( ;; )
+    {
+        wait 1;
+
+        if ( getdvar( "zp_config_print" ) != "1" )
+            continue;
+
+        setdvar( "zp_config_print", "0" );
+
+        println( "---- ZPause settings ----" );
+        /*
+            The header and footer are unconditional: they are what
+            says the switch was read at all, which is the question
+            being asked when somebody reaches for this.
+        */
+        level.zp_cfg_host = zp_host_player();
+
+        /*
+            Any player will do if there is no host to be found. A
+            dump nobody can see is the same as no dump, and this is
+            reached for precisely when something is already unclear.
+        */
+        if ( !isdefined( level.zp_cfg_host ) )
+        {
+            zp_cfg_players = get_players();
+
+            if ( zp_cfg_players.size > 0 )
+                level.zp_cfg_host = zp_cfg_players[0];
+        }
+
+        if ( isdefined( level.zp_cfg_host ) )
+            level.zp_cfg_host iprintln( "^3[ZPause]^7 settings changed from default:" );
+
+        level.zp_cfg_echo = 1;
+        zp_load_config();
+        level.zp_cfg_echo = 0;
+
+        if ( isdefined( level.zp_cfg_host ) )
+            level.zp_cfg_host iprintln( "^3[ZPause]^7 end of settings" );
+
+        level.zp_cfg_host = undefined;
+        println( "---- end ----" );
+    }
+}
+
 zp_build_watermark()
 {
     level endon( "end_game" );
@@ -2880,21 +3611,29 @@ zp_build_watermark()
     if ( isdefined( level.zp_build_hud ) )
         return;
 
-    e = createserverfontstring( "default", 0.9 );
+    /*
+        Scale 1.1, and not the 0.9 a watermark looks like it wants: a font
+        scale below 1 does not shrink the text on any of these engines, it
+        falls back to something several times larger. Every other element
+        here asks for 1.0 or more, and release_check.py enforces it.
 
-    // Top right, below the Plutonium watermark.
-    e.horzalign = "right";
-    e.vertalign = "top";
-    e.alignx = "right";
-    e.aligny = "top";
-    e.x = -10;
-    e.y = 24;
-
+        Offsets are measured from inside the safe area and anything past it
+        is clipped, by a different amount per engine and per aspect ratio
+        -- which is how this went off screen on three ports and not the
+        fourth. 0, 8 is the corner itself.
+    */
+    e = createserverfontstring( "objective", 1.1 );
+    e setpoint( "TOPRIGHT", "TOPRIGHT", 0, 8 );
     e.color = ( 1, 0.82, 0.15 );
-    e.alpha = 0.7;
-    e.sort = 1000;
-    e.foreground = 1;
-    e settext( stamp );
+    zp_hud_style( e, 0.7 );
+    /*
+        The origin rides along with the stamp. Only the copy that won the
+        zp_origin_wanted() gate ever gets here, so whatever this says is
+        the copy actually running -- which is the whole question
+        zp_only_script and zp_only_mod are for, and it cannot be answered
+        by looking at two identical-looking games.
+    */
+    e settext( stamp + "  [" + zp_origin() + "]" );
 
     level.zp_build_hud = e;
 }

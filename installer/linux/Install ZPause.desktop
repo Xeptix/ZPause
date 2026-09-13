@@ -1,0 +1,19 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=Install ZPause
+GenericName=Synced co-op pause for Zombies
+Comment=Find your install and copy ZPause into it
+Icon=applications-games
+Terminal=true
+StartupNotify=false
+Categories=Game;
+Path=
+
+# Runs the install.sh sitting beside this file, whichever folder you
+# extracted it to. %k is the location of this desktop file; some launchers
+# hand it over as a file:// URI, hence the prefix strip. The read at the
+# end keeps the terminal open so you can see what it did.
+Exec=bash -c 'k="%k"; k="${k#file://}"; d="$(dirname "$k")"; cd "$d" || { echo "Could not find the folder this file is in."; read -rp "Press Enter to close. "; exit 1; }; if [ -f ./install.sh ]; then bash ./install.sh; else echo; echo "  install.sh is not next to this file."; echo "  Extract the whole archive and run it from there."; echo; fi; read -rp "Press Enter to close. "'
+
+X-KDE-SubstituteUID=false
