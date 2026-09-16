@@ -23,7 +23,8 @@
         install.bat -List                 what is installed, then stop
         install.bat -Configure            open the settings editor
         install.bat -Game t8              skip the "which one?" question
-        install.bat -To "D:\Plutonium"    skip the "where?" question
+        install.bat -To "D:\Plutonium"    use this folder, even over a remembered one
+        install.bat -ZBundle              with -Install -Yes: add ZBundle on Black Ops II
 #>
 param(
     [switch]$Find,
@@ -34,6 +35,7 @@ param(
     [switch]$Yes,
     [switch]$NoColour,
     [switch]$NoColor,
+    [switch]$ZBundle,
     [string]$Game,
     [string]$To
 )
@@ -547,12 +549,99 @@ function Root-For($family, $forceAsk) {
     return $root
 }
 
+<#
+    The folder a path really is, through any junction or symlink on the way.
+
+    Neither Resolve-Path nor [IO.Path]::GetFullPath follows a junction on
+    Windows PowerShell 5.1 -- both hand the path back as typed -- so this
+    walks it a component at a time and asks each for its Target. A component
+    that does not exist yet stops the walk and keeps the rest as written,
+    which is what a folder an install is about to create needs.
+#>
+function Real-Path($p) {
+    if (-not $p) { return $p }
+    $root = [IO.Path]::GetPathRoot($p)
+    $cur = $root
+    foreach ($part in @($p.Substring($root.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $cur = Path-Join $cur $part
+        for ($hop = 0; $hop -lt 8; $hop++) {
+            try { $it = Get-Item -LiteralPath $cur -Force -ErrorAction Stop } catch { break }
+            if (-not ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)) { break }
+            $to = @($it.Target)[0]
+            if (-not $to) { break }
+            if (-not [IO.Path]::IsPathRooted($to)) { $to = Path-Join (Split-Path -Parent $cur) $to }
+            $cur = $to
+        }
+    }
+    return $cur
+}
+
+<#
+    Every folder beside a Black Ops III folder whose name starts with its
+    name -- the per-client copies a player can keep, "... BOIII",
+    "... EzzBOIII", "... T7x" -- as one row for each client a copy carries,
+    saying whether that client's folder is its own or a link back into the
+    folder it sits beside. A copy that carries no client gets a row with no
+    client in it, so -Find can say why nothing is installed there.
+
+    It reads the disk and writes nothing. That is what lets -Find use it:
+    -Find promises to change nothing, and the table expansion that also
+    uses it runs after Root-Quiet, which may remember a folder.
+#>
+function Bo3-Copies($hub) {
+    $out = @()
+    if (-not $hub) { return $out }
+    $parent = Split-Path -Parent $hub
+    $leaf = Split-Path -Leaf $hub
+    if (-not $parent -or -not (Test-Here $parent)) { return $out }
+    $copies = @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $leaf -and $_.Name.StartsWith($leaf) } |
+                Sort-Object Name)
+    foreach ($c in $copies) {
+        $tag = $c.Name.Substring($leaf.Length).Trim(' ', '-', '_')
+        if (-not $tag) { continue }
+        $any = $false
+        # A client is there if its exe is or its folder is -- the same
+        # markers the game-folder slots use.
+        foreach ($client in @('boiii', 't7x')) {
+            if (-not (Test-Here (Path-Join $c.FullName ($client + '.exe'))) -and
+                -not (Test-Here (Path-Join $c.FullName $client))) { continue }
+            $any = $true
+            $real = (Real-Path (Path-Join $c.FullName $client)).ToLowerInvariant()
+            $hubs = (Real-Path (Path-Join $hub $client)).ToLowerInvariant()
+            $out += [pscustomobject]@{
+                Name = $c.Name; Path = $c.FullName; Tag = $tag
+                Client = $client; Real = $real; Own = ($real -ne $hubs)
+            }
+        }
+        if (-not $any) {
+            $out += [pscustomobject]@{
+                Name = $c.Name; Path = $c.FullName; Tag = $tag
+                Client = $null; Real = $null; Own = $false
+            }
+        }
+    }
+    return $out
+}
+
 if ($Find) {
     foreach ($fam in @('pluto', 'bo3', 'bo4')) {
         Head $FAMILIES[$fam].Label
         $hits = @(Find-Roots $fam)
-        if ($hits.Count -eq 0) { Say 'none found' DarkGray }
-        else { foreach ($p in $hits) { Say $p } }
+        if ($hits.Count -eq 0) { Say 'none found' DarkGray; continue }
+        foreach ($p in $hits) {
+            Say $p
+            if ($fam -ne 'bo3') { continue }
+            # The per-client copies beside it, and whether each is an install
+            # target of its own. Without this, a machine with a folder per
+            # client reported one folder and gave no hint of the rest.
+            foreach ($row in @(Bo3-Copies $p)) {
+                $what = 'no client -- nothing installs here'
+                if ($row.Client -and $row.Own) { $what = $row.Client + ' -- its own, installed to separately' }
+                elseif ($row.Client) { $what = $row.Client + ' -- shares this folder''s' }
+                Say ('    ... ' + $row.Tag.PadRight(12) + $what) DarkGray
+            }
+        }
     }
     Blank
     return
@@ -563,8 +652,10 @@ if ($Find) {
     Every place any of the five games can read ZPause from.
 
     Family says which root the path hangs off. Kind says what the slot is:
-    a file, a folder (Black Ops 4 takes a whole mod folder), or a compiled
-    file (T7x loads compiled GSC and nothing else). Black Ops III's loaders
+    a file, a folder (Black Ops 4 takes a whole mod folder), a compiled
+    file (T7x loads compiled GSC and nothing else), or an asset -- a file
+    the mod carries that is not a script, like T6's lobby menu .iwd, which
+    is copied and removed but never read or configured. Black Ops III's loaders
     are optional and independent, so a route there carries the markers
     that say whether that loader is even present.
 #>
@@ -575,6 +666,20 @@ $SLOTS = @(
        Path = 'storage\t6\scripts\zm\zpause.gsc' }
     @{ Key = 't6'; Family = 'pluto'; Kind = 'file'; Game = 'T6  mod version'
        Path = 'storage\t6\mods\zm_pause\scripts\zm\zpause.gsc' }
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Game = 'T6  mod lobby menu'
+       Path = 'storage\t6\mods\zm_pause\zpause.iwd' }
+    # ZBundle: ZPause and ZShare as one Black Ops II mod, for a player who wants
+    # both from the Mods menu, where Plutonium enables one mod at a time. Only
+    # the Treyarch bundle carries it, and it is offered rather than written with
+    # everything else, since it is a mod of its own. ZShare's script rides as
+    # an asset -- copied and removed with the ZPause script beside it, never
+    # read or configured.
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'file'; Extra = 'zbundle'; Game = 'T6  ZBundle mod'
+       Path = 'storage\t6\mods\zm_zbundle\scripts\zm\zpause.gsc' }
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle ZShare'
+       Path = 'storage\t6\mods\zm_zbundle\scripts\zm\zshare.gsc' }
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle lobby menu'
+       Path = 'storage\t6\mods\zm_zbundle\zpause.iwd' }
     @{ Key = 't5'; Family = 'pluto'; Kind = 'file'; Game = 'T5  Black Ops'
        Path = 'storage\t5\raw\scripts\sp\zpause.gsc' }
     @{ Key = 't4'; Family = 'pluto'; Kind = 'file'; Game = 'T4  World at War'
@@ -586,10 +691,21 @@ $SLOTS = @(
     # client's other home. Not under the game root, so it names its own base.
     @{ Key = 't7'; Family = 'bo3'; Kind = 'file'; Game = 'T7  BOIII (AppData)'
        Path = 'custom_scripts\zpause.gsc'; Base = (Path-Join $env:LOCALAPPDATA 'boiii\data')
-       Markers = @(); Note = 'the same client, its other script folder' }
+       Markers = @(); Note = "original BOIII's other script folder -- Ezz BOIII clears it on launch" }
     @{ Key = 't7'; Family = 'bo3'; Kind = 'compiled'; Game = 'T7  T7x'
        Path = 't7x\custom_scripts\zpause.gsc'; Markers = @('t7x.exe', 't7x')
        Note = 'compiled build, no mod slot' }
+    # The lobby settings menu, as plain Lua each client loads from ui_scripts.
+    # Game folder only: a client's %LOCALAPPDATA% data folder is its own,
+    # and Ezz BOIII prunes everything its manifest does not list the moment
+    # it launches, so a menu put there is gone before the frontend loads.
+    # The Workshop build carries its own in core_mod and needs neither.
+    @{ Key = 't7'; Family = 'bo3'; Kind = 'folder'; Files = 'lua'; Game = 'T7  BOIII lobby menu'
+       Path = 'boiii\ui_scripts\zpause'; Markers = @('boiii.exe', 'boiii')
+       Note = 'the lobby settings menu' }
+    @{ Key = 't7'; Family = 'bo3'; Kind = 'folder'; Files = 'lua'; Game = 'T7  T7x lobby menu'
+       Path = 't7x\ui_scripts\zpause'; Markers = @('t7x.exe', 't7x')
+       Note = 'the lobby settings menu' }
     @{ Key = 't8'; Family = 'bo4'; Kind = 'folder'; Game = 'T8  Black Ops 4'
        Path = 'project-bo4\mods\zpause' }
 )
@@ -608,11 +724,43 @@ function Root-Of($family) {
     return $null
 }
 
+<#
+    The folder -To names, when it is one of this family's -- the folder
+    itself, or one holding it under the family's usual subfolder names.
+
+    It comes ahead of a remembered folder, not only ahead of a question:
+    Root-Ask goes through Root-Quiet first, so a -To that was checked only
+    where the question is asked was never read at all once a folder had been
+    remembered. It is remembered in turn only when nothing valid is -- a
+    -To for a second install, or a test copy, should not quietly replace the
+    folder every other run uses.
+#>
+function To-Root($family) {
+    if (-not $To) { return $null }
+    $f = $FAMILIES[$family]
+    $t = $To.Trim().Trim('"')
+    foreach ($sub in @('') + $f.Subs) {
+        $try = $t
+        if ($sub) { $try = Path-Join $t $sub }
+        if (Is-Root $family $try) { return $try }
+    }
+    return $null
+}
+
 function Root-Quiet($family) {
     # The remembered or the only-found root, without asking anybody.
     # Scanning "what is installed" must never turn into a question.
     $r = Root-Of $family
     if ($r) { return $r }
+    $r = To-Root $family
+    if ($r) {
+        $script:Roots[$family] = $r
+        if (-not ($Settings[$family] -and (Is-Root $family $Settings[$family]))) {
+            $Settings[$family] = $r
+            Save-Settings $Settings
+        }
+        return $r
+    }
     if ($Settings[$family] -and (Is-Root $family $Settings[$family])) {
         $script:Roots[$family] = $Settings[$family]
         return $Settings[$family]
@@ -630,6 +778,10 @@ function Root-Quiet($family) {
 function Root-Ask($family) {
     # The same, but it may ask -- for when the user has chosen a game in
     # that family and there is no getting on without a folder.
+    #
+    # A -To that is not this game's folder is said out loud, by Choose-Root,
+    # rather than quietly swapped for a remembered one.
+    if ($To -and -not (To-Root $family)) { return (Root-For $family $false) }
     $r = Root-Quiet $family
     if ($r) { return $r }
     $r = Root-For $family $false
@@ -648,6 +800,33 @@ function Slot-Path($slot) {
     return (Path-Join $base $slot.Path)
 }
 
+<#
+    What a folder slot is made of, and the file whose being there means it
+    is installed at all.
+
+    Both were the Black Ops 4 mod folder's shape written into three
+    separate functions -- the extension list in Install-Plan and
+    Do-Uninstall, metadata.json in Slot-Version -- which is what made
+    Kind 'folder' mean "a Black Ops 4 mod" rather than "a folder of ours".
+    A slot that is a folder of something else says so and the three follow.
+#>
+function Slot-Kindof($slot) {
+    if ($slot.ContainsKey('Files') -and $slot.Files) { return $slot.Files }
+    return 'mod'
+}
+
+function Slot-Files($slot) {
+    # A token in the table rather than a pattern, so both installers' slot
+    # tables say the same word in a language that spells patterns its own way.
+    if ((Slot-Kindof $slot) -eq 'lua') { return '\.lua$' }
+    return '\.(json|gscc|gsic|luac)$'
+}
+
+function Slot-Marker($slot) {
+    if ((Slot-Kindof $slot) -eq 'lua') { return '__init__.lua' }
+    return 'metadata.json'
+}
+
 function Slot-Present($slot) {
     # For a Black Ops III route: is that loader even installed? Only the
     # routes whose loader exists are offered, and a route with no markers
@@ -656,13 +835,70 @@ function Slot-Present($slot) {
     $base = Slot-Base $slot
     if (-not $base) { return $false }
     if ($slot.Markers.Count -eq 0) { return (Test-Here $base) }
+    # Against the slot's own base, not the family's root: a slot that names
+    # its own Base -- BOIII's AppData script folder, and the lobby menu's
+    # folders after it -- would otherwise be judged by whether a marker sat
+    # in the game folder, which is a different place entirely.
     foreach ($m in $slot.Markers) {
-        if (Test-Here (Path-Join (Root-Quiet $slot.Family) $m)) { return $true }
+        if (Test-Here (Path-Join $base $m)) { return $true }
     }
     return $false
 }
 
 $PLUTO = Root-Quiet 'pluto'
+
+<#
+    One Black Ops III folder per client.
+
+    A player can keep a copy of the game for each client -- "... BOIII",
+    "... EzzBOIII", "... T7x" beside the plain folder -- and the slots above
+    reach only the one folder the family resolved to. Most copies junction
+    their boiii\ and t7x\ back to it, so writing there already reaches them.
+    A copy that does not is an install target of its own that nothing above
+    would ever write to: Ezz BOIII's carries no boiii\ at all, and prunes its
+    whole %LOCALAPPDATA% data folder on launch, so its own game folder is
+    the only place ZPause survives there.
+
+    So every folder beside that one whose name starts with its name, and that
+    holds a client's exe, gets the game-folder slots again with its own Base
+    -- the mechanism the AppData slot already uses, so every screen that
+    walks $SLOTS sees them with nothing else changed. A client folder that
+    resolves to one already covered is a junction and is left out, which is
+    what keeps a machine with one copy exactly as it was.
+#>
+function Bo3-Expand {
+    $own = @(Bo3-Copies (Root-Quiet 'bo3') | Where-Object { $_.Client -and $_.Own })
+    if ($own.Count -eq 0) { return }
+
+    $rooted = @($SLOTS | Where-Object { $_.Family -eq 'bo3' -and -not $_.ContainsKey('Base') })
+    $seen = @{}
+    $extra = @()
+    foreach ($row in $own) {
+        # Two copies whose client folders are one folder are one target.
+        if ($seen.ContainsKey($row.Real)) { continue }
+        $seen[$row.Real] = $true
+        foreach ($s in $rooted) {
+            # A game-folder slot belongs to the client its path starts with.
+            if (($s.Path -split '[\\/]')[0] -ne $row.Client) { continue }
+
+            $clone = @{}
+            foreach ($k in $s.Keys) { $clone[$k] = $s[$k] }
+            $clone.Base = $row.Path
+            # The label column is 24 wide on every screen that shows one.
+            $suffix = ''
+            if ($s.Kind -eq 'folder') { $suffix = ' lobby menu' }
+            $room = 24 - 4 - $suffix.Length
+            $t = $row.Tag
+            if ($t.Length -gt $room) { $t = $t.Substring(0, $room) }
+            $clone.Game = 'T7  ' + $t + $suffix
+            $clone.Note = $s.Note + ', in ' + $row.Name
+            $extra += $clone
+        }
+    }
+    if ($extra.Count -gt 0) { $script:SLOTS = @($SLOTS) + $extra }
+}
+
+Bo3-Expand
 if ($PLUTO) {
     Head 'Plutonium'
     Say $PLUTO
@@ -678,10 +914,23 @@ function Read-Version($file) {
 }
 
 function Slot-Version($slot, $full) {
+    if ($slot.Kind -eq 'asset') {
+        # Nothing inside it says which version it is. It installs with the
+        # mod copy of the script beside it, so it goes by that one -- a
+        # folder up from the lobby menu, or in the same folder as ZBundle's
+        # ZShare script.
+        if (-not (Test-Here $full)) { return $null }
+        $dir = Split-Path -Parent $full
+        foreach ($c in @('scripts\zm\zpause.gsc', 'zpause.gsc')) {
+            $v = Read-Version (Path-Join $dir $c)
+            if ($v) { return $v }
+        }
+        return '?'
+    }
     if ($slot.Kind -eq 'folder') {
         # What the mod folder holds is compiled, so nothing in it says which
         # version it is. The stamp the installer wrote does.
-        if (-not (Test-Here (Path-Join $full 'metadata.json'))) { return $null }
+        if (-not (Test-Here (Path-Join $full (Slot-Marker $slot)))) { return $null }
         $stamp = Path-Join $full 'zpause.installed'
         if (Test-Here $stamp) {
             try { return (Get-Content -LiteralPath $stamp -TotalCount 1).Trim() } catch {}
@@ -711,15 +960,21 @@ function Get-Installed {
         if (-not $v) { continue }
         $rows += [pscustomobject]@{
             Key = $slot.Key; Family = $slot.Family; Kind = $slot.Kind
-            Game = $slot.Game; Path = $full; Version = $v
+            Game = $slot.Game; Path = $full; Version = $v; Slot = $slot
         }
     }
     return @($rows)
 }
 
 function Short-Path($row) {
+    # The separator matters: "Call of Duty Black Ops III" is a proper prefix
+    # of "Call of Duty Black Ops III T7x" and of every other per-client copy
+    # beside it, so without it a path in a sibling folder shortens to
+    # "T7x\t7x\custom_scripts\zpause.gsc" and reads as one inside the
+    # original.
     $base = Root-Of $row.Family
-    if ($base -and $row.Path.StartsWith($base)) { return ('...' + $row.Path.Substring($base.Length)) }
+    if ($base) { $base = $base.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar }
+    if ($base -and $row.Path.StartsWith($base)) { return ('...' + [IO.Path]::DirectorySeparatorChar + $row.Path.Substring($base.Length)) }
     return $row.Path
 }
 
@@ -741,7 +996,7 @@ function Show-Installed {
     for ($i = 0; $i -lt $rows.Count; $i++) {
         $row = $rows[$i]
         $ver = 'v' + $row.Version
-        $known = Ref-For $row.Version $row.Key $row.Kind
+        $known = Ref-For $row.Version $row.Key $row.Kind $row.Path
         $edited = $false
         if ($row.Kind -ne 'folder') {
             $edited = $known -and -not (Same-File $known $row.Path)
@@ -1044,12 +1299,38 @@ function Same-File($a, $b) {
 function First-Script($source) {
     if (-not $source -or -not (Test-Here $source)) { return $null }
     try {
-        if (-not (Get-Item -LiteralPath $source).PSIsContainer) { return $source }
+        $item = Get-Item -LiteralPath $source
+        if (-not $item.PSIsContainer) { return $source }
     } catch { return $null }
-    $f = @(Get-ChildItem -LiteralPath $source -Recurse -Filter '*.gsc' -ErrorAction SilentlyContinue) |
-         Select-Object -First 1
-    if ($f) { return $f.FullName }
+    # A loose script before one in a mod folder. T6's download carries both,
+    # and the mod copy is the variant that calls itself the mod one: found
+    # first, it went into the two loose slots as well, and whichever copy
+    # the game ran said it was the mod.
+    $base = $item.FullName.TrimEnd('\', '/')
+    $all = @(Get-ChildItem -LiteralPath $source -Recurse -Filter '*.gsc' -ErrorAction SilentlyContinue |
+             Sort-Object FullName)
+    $loose = @($all | Where-Object { $_.FullName.Substring($base.Length) -notmatch '^[\\/]mods[\\/]' })
+    if ($loose.Count -gt 0) { return $loose[0].FullName }
+    if ($all.Count -gt 0) { return $all[0].FullName }
     return $null
+}
+
+<#
+    T6's mod-folder copy: a generated variant of the same script, differing
+    only in what zp_origin() returns. A download carries it at its own path,
+    a source folder beside the loose one as zpause_mod.gsc. The install and
+    the "does this match its version" check both take it from here, or the
+    mod slot gets a copy that calls itself the script one -- or reads as
+    edited against one.
+#>
+function Mod-Copy($root, $from, $key) {
+    $inTree = Path-Join $root ('Plutonium\storage\' + $key + '\mods\zm_pause\scripts\zm\zpause.gsc')
+    if (Test-Here $inTree) { return $inTree }
+    if ($from) {
+        $flat = Path-Join (Split-Path -Parent $from) 'zpause_mod.gsc'
+        if (Test-Here $flat) { return $flat }
+    }
+    return $from
 }
 
 <#
@@ -1068,6 +1349,14 @@ function Payload-In($root, $key, $kind) {
     $flatGame = $Release['game']
     switch ($key) {
         { $_ -in 't6', 't5', 't4' } {
+            if ($kind -eq 'asset') {
+                $inTree = Path-Join $root ('Plutonium\storage\' + $key + '\mods\zm_pause\zpause.iwd')
+                if (Test-Here $inTree) { return $inTree }
+                if ($flatGame -eq $key -and (Test-Here (Path-Join $root 'zpause.iwd'))) {
+                    return (Path-Join $root 'zpause.iwd')
+                }
+                return $null
+            }
             $tree = First-Script (Path-Join $root ('Plutonium\storage\' + $key))
             if ($tree) { return $tree }
             if ($flatGame -eq $key -and (Test-Here (Path-Join $root 'zpause.gsc'))) {
@@ -1082,6 +1371,19 @@ function Payload-In($root, $key, $kind) {
                 }
                 return $null
             }
+            # The lobby menu: one folder of Lua that every ui_scripts slot
+            # installs from, in a download or beside the script in src/.
+            if ($kind -eq 'folder') {
+                foreach ($c in @('Black Ops III\boiii\ui_scripts\zpause', 'ui_scripts\zpause')) {
+                    $d = Path-Join $root $c
+                    if (Test-Here (Path-Join $d '__init__.lua')) { return $d }
+                }
+                return $null
+            }
+            # Anything else asked for here has nothing to hand back. Falling
+            # through to the script below gave a Lua folder slot zpause.gsc
+            # as its source.
+            if ($kind -ne 'file') { return $null }
             $inTree = Path-Join $root 'Black Ops III\boiii\custom_scripts\zpause.gsc'
             if (Test-Here $inTree) { return $inTree }
             if ($flatGame -eq 't7' -and (Test-Here (Path-Join $root 'zpause.gsc'))) {
@@ -1114,20 +1416,33 @@ function Games-Here {
     return @($out)
 }
 
-function Ref-For($version, $key, $kind) {
+function Ref-For($version, $key, $kind, $path) {
     # A known-good copy of that version of that game, for telling an
     # untouched install apart from one somebody has edited. Only versions
     # on this PC can be checked; anything else simply is not claimed either
     # way. Keyed by game as well as version: inside the bundle every game
     # shares a version, and the first script found was the wrong game's.
+    # And by copy: an installed path in T6's mod folder is held up against
+    # the mod variant, not the loose script it differs from by a line.
     if (-not $version -or $version -eq '?') { return $null }
     if (-not $kind) { $kind = 'file' }
-    $ck = $version + '|' + $key + '|' + $kind
+    # ZBundle's ZPause script is the same mod variant as zm_pause's, and its
+    # lobby menu the same .iwd. Its ZShare script is nobody else's, so that
+    # one is held up against ZBundle's own copy in the download.
+    $mod = ($kind -eq 'file' -and $path -and $path -match '\\mods\\zm_(pause|zbundle)\\')
+    $zshare = ($path -and $path -like '*\mods\zm_zbundle\*\zshare.gsc')
+    $ck = $version + '|' + $key + '|' + $kind + '|' + $mod + '|' + $zshare
     if ($script:RefCache.ContainsKey($ck)) { return $script:RefCache[$ck] }
     $found = $null
     foreach ($c in (Get-Choices)) {
         if ($c.Version -ne $version) { continue }
-        $found = Payload-In $c.Folder $key $kind
+        if ($zshare) {
+            $found = Path-Join $c.Folder ('Plutonium\storage\' + $key + '\mods\zm_zbundle\scripts\zm\zshare.gsc')
+            if (-not (Test-Here $found)) { $found = $null }
+        } else {
+            $found = Payload-In $c.Folder $key $kind
+            if ($found -and $mod) { $found = Mod-Copy $c.Folder $found $key }
+        }
         if ($found) { break }
     }
     $script:RefCache[$ck] = $found
@@ -1516,24 +1831,23 @@ function Install-Plan($key) {
             foreach ($f in @(Get-ChildItem -LiteralPath $src -File -ErrorAction SilentlyContinue)) {
                 # Only what the mod is made of. A README sitting beside the
                 # payload in a source folder is not part of it.
-                if ($f.Name -notmatch '\.(json|gscc|gsic|luac)$') { continue }
+                if ($f.Name -notmatch (Slot-Files $slot)) { continue }
                 $plan += [pscustomobject]@{ From = $f.FullName; To = (Path-Join $to $f.Name); Kind = 'file'; Slot = $slot }
             }
             $plan += [pscustomobject]@{ From = $null; To = (Path-Join $to 'zpause.installed'); Kind = 'stamp'; Slot = $slot }
             continue
         }
+        if ($slot.Extra) {
+            $from = Extra-Payload $slot
+            if (-not $from) { continue }
+            $plan += [pscustomobject]@{ From = $from; To = $to; Kind = $slot.Kind; Slot = $slot }
+            continue
+        }
         $from = Payload-For $key $slot.Kind
         if (-not $from) { continue }
-        # T6's mod-folder copy is a generated variant of the same script,
-        # differing only in what zp_origin() returns. A download carries it
-        # at its own path already; a source folder has it lying beside the
-        # loose one, so pick it up here or the mod slot gets a copy that
-        # calls itself the script one.
-        if ($slot.Path -like '*mods\zm_pause*') {
-            $inTree = Path-Join $script:Root ('Plutonium\' + $slot.Path)
-            $flat = Path-Join (Split-Path -Parent $from) 'zpause_mod.gsc'
-            if (Test-Here $inTree) { $from = $inTree }
-            elseif (Test-Here $flat) { $from = $flat }
+        # T6's mod-folder copy is a variant of the same script; see Mod-Copy.
+        if ($slot.Kind -eq 'file' -and $slot.Path -like '*mods\zm_pause*') {
+            $from = Mod-Copy $script:Root $from $key
         }
         $plan += [pscustomobject]@{ From = $from; To = $to; Kind = $slot.Kind; Slot = $slot }
     }
@@ -1580,12 +1894,56 @@ function Pick-Install-Game($here) {
     return $GAMES[$n - 1].Key
 }
 
+<#
+    Where an extra's file is inside the Treyarch bundle: at the path it
+    installs to, under the download's Plutonium folder. Nothing else carries
+    one, so anywhere else this answers nothing and the extra is not offered.
+#>
+function Extra-Payload($slot) {
+    if (-not $script:Root -or -not $slot.Extra) { return $null }
+    $p = Path-Join $script:Root ('Plutonium\' + $slot.Path)
+    if (Test-Here $p) { return $p }
+    return $null
+}
+
+<#
+    ZBundle is asked about, not assumed: it is a second Black Ops II mod, and
+    most players want one or the other. Already installed, the answer
+    defaults to yes, so an update keeps it in step with the ZPause beside it;
+    -Yes takes that default, and -ZBundle says yes outright.
+#>
+function Pick-ZBundle($mine) {
+    $extras = @($mine | Where-Object { $_.Extra -eq 'zbundle' -and (Extra-Payload $_) })
+    if ($extras.Count -eq 0) { return }
+    $have = @($extras | Where-Object { $p = Slot-Path $_; $p -and (Test-Here $p) }).Count -gt 0
+    $want = [bool]$ZBundle -or $have
+    if (-not $script:AssumeYes) {
+        $zs = ''
+        $zsSlot = @($extras | Where-Object { $_.Path -like '*zshare.gsc' } | Select-Object -First 1)
+        if ($zsSlot.Count -gt 0) {
+            try {
+                $head = (Get-Content -LiteralPath (Extra-Payload $zsSlot[0]) -TotalCount 40) -join "`n"
+                if ($head -match 'ZSHARE v([0-9][0-9.]*d?)') { $zs = ' v' + $Matches[1] }
+            } catch {}
+        }
+        Blank
+        Say ('This download also carries ZBundle: ZPause and ZShare' + $zs + ' as one mod,') White
+        Say 'for playing both from the Mods menu. It goes in mods\zm_zbundle, beside' DarkGray
+        Say 'zm_pause, and does nothing until you pick zm_zbundle there.' DarkGray
+        $def = 'n'
+        if ($want) { $def = 'y' }
+        $want = Ask 'Install ZBundle as well?' $def
+    }
+    foreach ($s in $extras) { $s.PickedForInstall = $want }
+}
+
 function Pick-Routes($key) {
     # Black Ops III has three loaders, all optional and all independent, so
     # each route is a tick box: found loaders start ticked. Everywhere else
     # every slot for the game is written, the way it always was.
     $mine = @($SLOTS | Where-Object { $_.Key -eq $key })
-    foreach ($slot in $mine) { $slot.PickedForInstall = $true }
+    foreach ($slot in $mine) { $slot.PickedForInstall = -not $slot.Extra }
+    Pick-ZBundle $mine
     if ($key -ne 't7') { return $true }
 
     foreach ($slot in $mine) { $slot.PickedForInstall = (Slot-Present $slot) }
@@ -1658,7 +2016,19 @@ function Do-Install($noConfirm, $key) {
     }
 
     $root = Root-Ask $g.Family
-    if (-not $root) { Blank; Say 'Nothing changed.' Red; return }
+    if (-not $root) {
+        # A route that names its own base needs no game folder at all.
+        # BOIII's AppData script folder is one, and on Ezz BOIII -- which
+        # carries no boiii\ of its own -- it is the only route there is.
+        # Stopping here refused an install that had somewhere perfectly
+        # good to go.
+        $own = @($SLOTS | Where-Object {
+            $_.Key -eq $key -and $_.ContainsKey('Base') -and $_.Base -and (Test-Here $_.Base)
+        })
+        if ($own.Count -eq 0) { Blank; Say 'Nothing changed.' Red; return }
+        Blank
+        Say 'No game folder found -- carrying on with the routes that do not need one.' Yellow
+    }
 
     $v = $Release['version']
     $already = @(@(Get-Installed) | Where-Object { $_.Key -eq $key } |
@@ -1688,7 +2058,13 @@ function Do-Install($noConfirm, $key) {
     foreach ($p in $plan) {
         if ($p.Kind -eq 'stamp') { continue }
         $show = $p.To
-        if ($show.StartsWith($root)) { $show = $show.Substring($root.Length + 1) }
+        # Guarded, because $root can now be empty, and separator-qualified,
+        # because "Call of Duty Black Ops III" is a proper prefix of every
+        # per-client copy sitting beside it.
+        if ($root) {
+            $cut = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if ($show.StartsWith($cut)) { $show = $show.Substring($cut.Length) }
+        }
         Say ('    ' + $show)
     }
     Blank
@@ -1722,6 +2098,9 @@ function Do-Install($noConfirm, $key) {
     Blank
     $script:CountInstalled += $n
     if ($v) { Say "Installed $n file(s) -- v$v." Green } else { Say "Installed $n file(s)." Green }
+    if (@($plan | Where-Object { $_.Slot.Extra -eq 'zbundle' -and $_.Kind -ne 'stamp' }).Count -gt 0) {
+        Say 'ZBundle is in mods\zm_zbundle -- pick zm_zbundle in the Mods menu to run it.' DarkGray
+    }
     Reapply-Config
     if ($g.Family -eq 'bo4') {
         Say 'Only the host needs ZPause. Start a zombies match to load it.' DarkGray
@@ -1806,8 +2185,9 @@ function Do-Uninstall($all) {
                 # Files only, and only the ones the mod is made of. The
                 # folder stays: it is not ours to delete, and an empty one
                 # costs nothing.
+                $want = Slot-Files $t.Slot
                 foreach ($f in @(Get-ChildItem -LiteralPath $t.Path -File -ErrorAction SilentlyContinue)) {
-                    if ($f.Name -notmatch '\.(json|gscc|gsic|luac|installed)$') { continue }
+                    if ($f.Name -notmatch $want -and $f.Name -notmatch '\.installed$') { continue }
                     Backup-File $f.FullName
                     Remove-Item -LiteralPath $f.FullName -Force
                     Log 'removed' $f.FullName
@@ -2488,16 +2868,41 @@ function Show-Val($v) {
     return "$v"
 }
 
-function Load-Config($game) {
+<#
+    A cfg of `set name "value"` lines, as a table. The saved profile and
+    the game's own settings file are the same format on purpose -- the
+    script writes one the editor can read, and the editor writes one the
+    script can read -- so both come through here.
+#>
+function Parse-Cfg($f) {
     $v = @{}
-    $f = Config-File $game
-    if (-not (Test-Here $f)) { return $v }
+    if (-not $f -or -not (Test-Here $f)) { return $v }
     foreach ($line in (Get-Content -LiteralPath $f)) {
         if ($line -match '^\s*(?://.*)?$') { continue }
         if ($line -match '^\s*(?:set\s+|seta\s+)?(zp_[a-z0-9_]+)\s+"(.*)"\s*$') { $v[$Matches[1]] = $Matches[2]; continue }
         if ($line -match '^\s*(?:set\s+|seta\s+)?(zp_[a-z0-9_]+)\s+(\S+)\s*$') { $v[$Matches[1]] = $Matches[2] }
     }
     return $v
+}
+
+function Load-Config($game) {
+    return Parse-Cfg (Config-File $game)
+}
+
+<#
+    What the game is actually running.
+
+    The Plutonium games keep their settings in a file of their own that the
+    script reads as a match loads and the in-game menu rewrites when it
+    closes, so it -- not the saved profile -- is what is in force. The
+    editor shows it and the re-apply after an install leaves it alone,
+    which is what stops a setting changed in the pause menu from being
+    quietly thrown away by a profile saved weeks ago. Black Ops 4 does the
+    same with two files, the in-game menu's and the lobby menu's.
+#>
+function Live-Values($game) {
+    if ($game -eq 't8') { return (Read-Bo4-Values) }
+    return Parse-Cfg (Pluto-Cfg-Home $game)
 }
 
 function Cfg-Text($game, $dvars, $values) {
@@ -2532,7 +2937,7 @@ function Apply-ToScripts($game, $dvars, $values) {
     $script:ApplySkipped = @()
     foreach ($slot in $SLOTS) {
         if ($slot.Key -ne $game) { continue }
-        if ($slot.Kind -eq 'folder') { continue }
+        if ($slot.Kind -eq 'folder' -or $slot.Kind -eq 'asset') { continue }
         $f = Slot-Path $slot
         if (-not $f -or -not (Test-Here $f)) { continue }
         if ($slot.Kind -eq 'compiled' -or (Is-Compiled $f)) { $script:ApplySkipped += $slot.Game; continue }
@@ -2614,6 +3019,43 @@ function Cfg-Home($game) {
 }
 
 <#
+    Where the Plutonium games read their settings from, and the reason
+    this is a different path from the exported cfg above.
+
+    Plutonium's file functions are rooted at the game's own scriptdata
+    folder, so that is the one place the script, the in-game settings menu
+    and this editor can all reach. The script reads it as a match loads;
+    the menu rewrites it when it closes. That is what makes a change made
+    in any one of the three turn up in the other two.
+
+    It is written on every apply, not only on export, because the script
+    takes it ahead of the defaults written into the script itself -- a
+    stale copy left behind would quietly outrank the change just made
+    here.
+#>
+function Pluto-Cfg-Home($game) {
+    if ((Game-For $game).Family -ne 'pluto') { return $null }
+    $root = Root-Quiet 'pluto'
+    if (-not $root) { return $null }
+    return (Path-Join $root ('storage\' + $game + '\raw\scriptdata\zpause.cfg'))
+}
+
+function Write-Pluto-Cfg($game, $dvars, $values) {
+    $out = Pluto-Cfg-Home $game
+    if (-not $out) { return $null }
+    try {
+        $dir = Split-Path -Parent $out
+        if (-not (Test-Here $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [IO.File]::WriteAllText($out, (Cfg-Text $game $dvars $values))
+        Log 'exported' $out
+        return $out
+    } catch {
+        Say ('Could not write ' + $out + ': ' + $_.Exception.Message) Red
+    }
+    return $null
+}
+
+<#
     Black Ops 4 reads its settings from a JSON file at load: a list of
     { name, value } objects, not one object of pairs, because Shield turns
     a JSON object into a script struct whose fields can only be read by a
@@ -2662,6 +3104,84 @@ function Write-Json-Values($dvars, $values) {
 }
 
 <#
+    The lobby menu's file, beside that one. The lobby writes a key per
+    setting as it is changed and reads them back into the dvars as the game
+    starts, and a dvar outranks zpause.json -- so this is written on every
+    apply as well, with the same values, or a change made here would be
+    undone by an older one chosen in the lobby. One object of strings,
+    because that is what Shield's readjson and writejson read and write.
+#>
+function Lobby-Json-Home {
+    $base = Root-Quiet 'bo4'
+    if (-not $base) { return $null }
+    return (Path-Join $base 'project-bo4\saved\server\zpause_lobby.json')
+}
+
+function Write-Lobby-Json($dvars, $values) {
+    $f = Lobby-Json-Home
+    if (-not $f) { return }
+    $parts = @()
+    foreach ($d in $dvars) {
+        if (-not $values.ContainsKey($d.Name)) { continue }
+        $v = "$($values[$d.Name])"
+        if ($v -eq "$($d.Default)") { continue }
+        $parts += ('    "' + $d.Name + '": "' + ($v -replace '"', '\"') + '"')
+    }
+    try {
+        if ($parts.Count -eq 0) {
+            if (Test-Here $f) { Backup-File $f; Remove-Item -LiteralPath $f -Force; Log 'removed' $f }
+            return
+        }
+        $dir = Split-Path -Parent $f
+        if (-not (Test-Here $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Backup-File $f
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [IO.File]::WriteAllText($f, ("{`n" + ($parts -join ",`n") + "`n}`n"), $utf8)
+        Log 'configured' $f
+    } catch {
+        Say ('Could not write ' + $f + ': ' + $_.Exception.Message) Red
+    }
+}
+
+<#
+    What Black Ops 4 is running, from both files: zpause.json -- which the
+    installer writes as { name, value } and the in-game menu as
+    [ name, value ] -- with the lobby's file over it, since the lobby's
+    values go into the dvars. An empty value there is a setting put back to
+    DEFAULT in the lobby, which leaves zpause.json's in force.
+#>
+function Read-Bo4-Values {
+    $v = @{}
+    $f = Json-Home
+    if ($f -and (Test-Here $f)) {
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($f) } catch { }
+        $objects = '"name"\s*:\s*"(zp_[a-z0-9_]+)"\s*,\s*"value"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|([^,}\s]+))'
+        foreach ($m in [regex]::Matches($text, $objects)) {
+            if ($m.Groups[2].Success) { $v[$m.Groups[1].Value] = ($m.Groups[2].Value -replace '\\"', '"') }
+            else { $v[$m.Groups[1].Value] = $m.Groups[3].Value }
+        }
+        foreach ($m in [regex]::Matches($text, '\[\s*"(zp_[a-z0-9_]+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]')) {
+            $v[$m.Groups[1].Value] = ($m.Groups[2].Value -replace '\\"', '"')
+        }
+        # What the in-game menu's pairs actually look like: Shield writes a
+        # script array as an object of "0", "1" keys under "$.type": "array".
+        foreach ($m in [regex]::Matches($text, '"0"\s*:\s*"(zp_[a-z0-9_]+)"\s*,\s*"1"\s*:\s*"((?:[^"\\]|\\.)*)"')) {
+            $v[$m.Groups[1].Value] = ($m.Groups[2].Value -replace '\\"', '"')
+        }
+    }
+    $l = Lobby-Json-Home
+    if ($l -and (Test-Here $l)) {
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($l) } catch { }
+        foreach ($m in [regex]::Matches($text, '"(zp_[a-z0-9_]+)"\s*:\s*"((?:[^"\\]|\\.)*)"')) {
+            if ($m.Groups[2].Value -ne '') { $v[$m.Groups[1].Value] = ($m.Groups[2].Value -replace '\\"', '"') }
+        }
+    }
+    return $v
+}
+
+<#
     T7x runs a compiled script, so nothing can be written into it. What it
     does have is an exec that reads from disk: its patched Cmd_Exec prefers
     a file under its gamesettings folder, matched on the last two path
@@ -2706,6 +3226,7 @@ function Apply-Values($game, $dvars, $values, $quiet) {
     # number of places written; says what it did unless told not to.
     if ($game -eq 't8') {
         $n = Write-Json-Values $dvars $values
+        if ($n -ge 0) { Write-Lobby-Json $dvars $values }
         if ($n -gt 0 -and -not $quiet) {
             Say ("Written to " + (Json-Home) + " -- it takes effect on the next match.") Green
         } elseif ($n -eq 0 -and -not $quiet) {
@@ -2715,13 +3236,23 @@ function Apply-Values($game, $dvars, $values, $quiet) {
     }
 
     $n = Apply-ToScripts $game $dvars $values
+
+    # The file the script reads for itself, which outranks those defaults.
+    $shared = $null
+    if ((Game-For $game).Family -eq 'pluto') { $shared = Write-Pluto-Cfg $game $dvars $values }
+
     if (-not $quiet) {
         if ($n -gt 0) {
             Say "Written into $n installed script(s) -- it takes effect on the next pause." Green
         } else {
             Say 'Nothing installed to write it into yet; it will be applied when you install.' DarkGray
         }
+        if ($shared) {
+            Say ("Written to " + $shared) Green
+            Say 'The in-game settings menu reads and writes that same file.' DarkGray
+        }
     }
+    if ($shared) { $n++ }
     if ($script:ApplySkipped -and $script:ApplySkipped.Count -gt 0) {
         $cfg = $null
         if ($game -eq 't7') { $cfg = Write-T7x-Cfg $dvars $values }
@@ -2781,6 +3312,11 @@ function Reapply-Config {
     if ((Apply-How) -eq 'cfg') { return }
     foreach ($g in $GAMES) {
         if (-not (Test-Here (Config-File $g.Key))) { continue }
+        # A game with a settings file of its own has already kept them --
+        # the install does not touch that file -- and putting the saved
+        # profile back over it would undo anything changed in the pause
+        # menu since.
+        if ((Live-Values $g.Key).Count -gt 0) { continue }
         $values = Load-Config $g.Key
         if ($values.Count -eq 0) { continue }
         $dvars = @(Dvars-For $g.Key)
@@ -2965,7 +3501,17 @@ function Do-Config {
     $desc = Read-Descriptions
     foreach ($d in $dvars) { if (-not $d.Desc -and $desc.ContainsKey($d.Name)) { $d.Desc = $desc[$d.Name] } }
     $script:Choices = Read-Choices (Script-For $game)
-    $values = Load-Config $game
+
+    # What the game is using beats what was saved here: the pause menu
+    # writes that file too, so this is where a change made in game arrives.
+    $values = Live-Values $game
+    if ($values.Count -gt 0) {
+        Say 'Showing the settings this game is using, from its own settings file.' DarkGray
+        Say 'Anything you changed in game is already here. Save to keep it as a profile.' DarkGray
+        Blank
+    } else {
+        $values = Load-Config $game
+    }
     $script:CfgDirty = $false
 
     for (;;) {
@@ -3127,6 +3673,10 @@ function Do-Doctor {
                 Note 'The mod-folder copy is present. It does nothing unless zm_pause is'
                 Note '      picked in the in-game Mods menu, and that takes your one mod slot.'
             }
+            if (@($mine | Where-Object { $_.Path -like '*\mods\zm_zbundle\*' }).Count -gt 0) {
+                Note 'ZBundle is present. It does nothing unless zm_zbundle is picked in the'
+                Note '      in-game Mods menu, where it runs ZPause and ZShare together.'
+            }
         }
     }
 
@@ -3135,7 +3685,7 @@ function Do-Doctor {
     $edited = @()
     foreach ($r in $rows) {
         if ($r.Kind -eq 'folder') { continue }
-        $known = Ref-For $r.Version $r.Key $r.Kind
+        $known = Ref-For $r.Version $r.Key $r.Kind $r.Path
         if ($known -and -not (Same-File $known $r.Path) -and -not (Is-Applied $r.Path)) {
             $edited += $r.Path
         }

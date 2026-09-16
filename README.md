@@ -50,16 +50,18 @@ Two copies, because Plutonium moved the script folder under `raw` at some point 
 one your build reads depends on how old it is. Only the one your build looks at is ever
 read, so there's nothing to choose.
 
-It also installs the mod packaging of the same file:
+It also installs the mod packaging of the same file, and the lobby menu that comes with it:
 
 ```
 %localappdata%\Plutonium\storage\t6\mods\zm_pause\scripts\zm\zpause.gsc
+%localappdata%\Plutonium\storage\t6\mods\zm_pause\zpause.iwd
 ```
 
 That copy does nothing unless you pick **zm_pause** from the in-game Mods menu, so having
-it there costs nothing. Use it *or* the script above, not both — and the script is usually
-the better pick, since Plutonium only enables one mod at a time, so it coexists with
-whatever else you're running while the mod version takes the slot.
+it there costs nothing. Use it *or* the script above, not both. The script is usually the
+better pick, since Plutonium only enables one mod at a time, so it coexists with whatever
+else you're running while the mod version takes the slot; the mod version is the one with
+the settings in the lobby as well — see [In the lobby](#in-the-lobby).
 
 ### Or run the installer
 
@@ -200,6 +202,37 @@ player resume without opening chat.
 Resuming runs a 3‑2‑1 countdown with **everything still frozen**, then releases the whole
 game at once and gives players 2 seconds of invulnerability so nobody eats a hit from a
 zombie that was mid‑swing.
+
+### The settings menu
+
+While the game is paused, the host can change ZPause's settings without the console. Hold
+**fire + melee** to open the menu:
+
+| Button | Does |
+|---|---|
+| aim / fire | move up and down the list |
+| grenade | change the setting |
+| melee | close |
+
+A switch flips, a list moves on to its next choice, and a number steps up through a few
+common values and back round to the lowest — exact values are still the console's. A
+change lands when play resumes, the same as one typed into the console, and is saved as the
+menu closes — see [Where settings are saved](#where-settings-are-saved). The menu closes
+itself when a vote opens, since the host needs the buttons back to vote. `zp_menu 0` turns
+it off.
+
+#### In the lobby
+
+The mod version has the same settings in the lobby too. Pick **zm_pause** in the Mods
+menu, and the zombies lobby gets a **ZPAUSE SETTINGS** button for the host: a page for each
+part of ZPause, with what the setting under the cursor does and what its default is beside
+it. Left and right change a setting. **DEFAULT** leaves it to the script's own default — or
+to the one the installer wrote, if you configured it there — and **RESET TO DEFAULTS**, at
+the bottom of the first page, puts every setting back there at once.
+
+A change made there is kept in your player config, so it is still set the next time the
+game starts, and a match picks it up as it loads. The loose script has no lobby button:
+Plutonium loads menus from a mod and nowhere else.
 
 ---
 
@@ -355,16 +388,38 @@ a pause to take effect, and the combo is what asks for one.
 `set zp_config_print 1` in the console prints every setting below with the value it is
 currently holding, then puts the switch back so it can be used again.
 
+### Where settings are saved
+
+Whatever you change in the pause menu is written to a file as you close the menu, and read
+back the next time a match loads:
+
+```
+Plutonium\storage\t6\raw\scriptdata\zpause.cfg
+```
+
+The installer's config editor writes that same file, in the same format, so it does not
+matter where you set something — the menu, the installer, a text editor, or `exec` on a
+dedicated server. Both installed copies of the script read the one file, so the loose
+script and the mod copy cannot drift apart. Only settings that differ from their default
+are listed, which is what keeps a default that changes in a later version applying to
+everything you never touched.
+
+The file supplies the **default** for each setting, so anything already set outranks it:
+the console for as long as the game is running, and the lobby menu for good, since what it
+saves is a `seta` that Plutonium restores at launch. Set the same thing in both places and
+the lobby wins.
+
 | Dvar | Default | What it does |
 |---|---|---|
 | `zp_host_only` | `0` | Only the host can pause or resume. Everyone else's chat command and combo are ignored, and a pause never goes to a vote. On a dedicated server there is no host, so it falls to whoever holds the first player slot. |
+| `zp_menu` | `1` | Let the host change settings from a menu while the game is paused: hold fire and melee to open it. |
 | `zp_only_script` | `0` | Debug. With both the loose script and the mod-folder copy installed, run only the loose one. |
 | `zp_only_mod` | `0` | Debug. The same, the other way round. Both off — the default — is whichever loads first. Both on leaves nothing running. **Read when the script loads**, so end the game and start a new one for a change to take. |
 | `zp_allow_short_words` | `0` | Also accept bare `p` / `u` / `pause` in chat. Off by default so normal conversation can't pause the game. |
 | `zp_button_combo` | `1` | Enable the button combos. |
 | `zp_combo` | `crouch_melee` | Which combo pauses: `crouch_melee`, `crouch_use`, `crouch_frag`, `crouch_ads`, `jump_melee`, `use_frag`, `frag_only`, `use_ads`, `use_attack`, `attack_ads`. |
 | `zp_button_hold_time` | `0.3` | How long the combo must be held. |
-| `zp_button_combo_dead` | `use_ads` | Combo used while downed or spectating, when stance and melee stop registering. Also takes `use_attack`, `attack_ads`, `use_frag`, `frag_only`. `""` = chat only. |
+| `zp_button_combo_dead` | `use_ads` | Combo used while downed or spectating, when stance and melee stop registering. Also takes `use_attack`, `attack_ads`, `use_frag`, `frag_only`. `none` = chat only. |
 | `zp_vote_no_combo_dead` | `use_attack` | The same, for a no vote. |
 | `zp_input_debug` | `0` | Print each player which buttons the server receives from them, for picking the two above. |
 | `zp_host_approve` | `0` | The host pauses at once; anyone else has to ask and the host answers yes or no. It runs as a vote only the host can cast, so the yes/no input, the HUD and the timeout are a vote's. Pausing only — resuming still follows `zp_vote`. `zp_host_only` wins where both are set. |
@@ -398,6 +453,7 @@ currently holding, then puts the switch back so it can be used again.
 | `zp_freeze_anims` | `1` | Put zombies in a standing idle pose instead of looping their last animation. |
 | `zp_silence_zombies` | `1` | Stop zombies growling while paused. |
 | `zp_godmode` | `1` | Make players invulnerable while paused. |
+| `zp_freeze_players` | `1` | Lock players in place while paused. `0` lets them walk around with their weapons down, locked again for the countdown — not recommended, because doors, the box, perks, traps and pickups can all still be used while the zombies are held. |
 | `zp_control_guard` | `1` | Re-apply the player freeze every tick, so a map script can't hand controls back mid-pause. |
 | `zp_freeze_clock` | `1` | Hold the match timer. |
 | `zp_freeze_powerups` | `1` | Stop ground powerups timing out. |
@@ -416,9 +472,9 @@ currently holding, then puts the switch back so it can be used again.
 | `zp_hud_panel_alpha` | `0.45` | How opaque that slab is. `1` is solid black. |
 | `zp_hud_panel_width` | `340` | How wide it is, in HUD units. |
 | `zp_hud_timer` | `1` | Show who paused and how long it's been under the banner. |
-| `zp_pause_sound` | `zmb_zombie_go_inert` | Played when the game is paused. `""` = silent. |
-| `zp_countdown_sound` | `zmb_tombstone_timer_count` | Played on each countdown tick. `""` = silent. |
-| `zp_resume_sound` | `zmb_zombie_end_inert` | Played when play resumes. `""` = silent. |
+| `zp_pause_sound` | `zmb_zombie_go_inert` | Played when the game is paused. Also takes `evt_nuked`, `zmb_box_poof`, `zmb_perks_power_on` and `evt_electrical_surge`. `none` = silent. |
+| `zp_countdown_sound` | `fly_equipment_pickup_plr` | Played on each countdown tick. Also takes `zmb_points_loop_off` and `zmb_cha_ching`. `none` = silent. |
+| `zp_resume_sound` | `zmb_zombie_end_inert` | Played when play resumes. Also takes `zmb_powerup_grabbed`, `zmb_perks_packa_ready`, `zmb_cha_ching` and `evt_player_upgrade`. `none` = silent. |
 
 ### Where the HUD sits
 
@@ -480,19 +536,23 @@ sound would have to ship as a fastfile and be installed by **every player** rath
 just the host, so ZPause uses the game's own audio instead.
 
 The defaults are what the game itself uses them for: a zombie plays `go_inert` and
-`end_inert` when it drops dormant and wakes back up, and `zmb_tombstone_timer_count` is
-the game's own once-a-second countdown tick. Other aliases worth trying, all of them
-played by core zombies scripts and so present on every map:
+`end_inert` when it drops dormant and wakes back up, and the countdown tick is the sound
+of picking equipment up. Other aliases worth trying, each one in the sound files of every
+map — TranZit and the maps that share its sounds, Nuketown, Die Rise, Mob of the Dead,
+Buried, Origins and the Diner:
 
 | Alias | What it is |
 |---|---|
-| `mpl_ui_timer_countdown` | The plain UI beep from the end-of-match clock. |
-| `zmb_tombstone_timer_out` | The sting when that timer runs out. |
-| `zmb_perks_power_on` | Power switch coming on. |
 | `zmb_cha_ching` | Points. |
 | `zmb_box_poof` | The magic box vanishing. |
 | `zmb_whoosh` | Short whoosh. |
-| `evt_perk_deny` | Buzzer. |
+| `zmb_powerup_grabbed` | Picking up a power-up. |
+| `zmb_points_loop_off` | Double Points running out. |
+| `evt_nuked` | The Nuke going off. |
+
+A map only plays a sound its own files carry, and one they don't carry plays nothing at
+all. `zmb_perks_power_on` (the power switch) and `evt_perk_deny` (a buzzer) are in every
+map's files but the Diner's.
 
 Swap one in from the console:
 
@@ -532,7 +592,9 @@ seconds:
 
 - **An AI enforcer** that re-freezes anything appearing mid-pause, keeps `ignoreall`
   pinned, and snaps back any AI that drifts. It's a safety net — if the engine freeze does
-  its job it never fires, so there's no jitter.
+  its job it never fires, so there's no jitter. It pins each zombie's goal where it stands,
+  except a zombie still on its way in through a window: that walk waits to arrive at its
+  own goal, and a goal at its feet would read as arrival.
 - **A player enforcer.** Map scripts that carry a player somewhere lock the controls for
   the ride and call `freezecontrols( 0 )` when it ends — Ascension's lander is the one
   that bites. That release lands mid-pause and hands one player free movement around a
@@ -614,9 +676,8 @@ calls exists in the stock T6 script corpus.
 | World at War (T4) | [ZPauseT4](https://github.com/Xeptix/ZPauseT4) |
 
 Versions are kept in step: the same version number means the same feature set, allowing
-for what each engine can actually do. Neither older port has chat commands — those
-engines have no `say` callback — and both do the AI freeze entirely in script, since
-`disablezombies()` is a Black Ops II builtin.
+for what each engine can actually do. Both older ports do the AI freeze entirely in
+script, since `disablezombies()` is a Black Ops II builtin.
 
 **All five in one download.** The
 [Treyarch Bundle](https://github.com/Xeptix/ZPause/releases/latest) carries every game
@@ -628,6 +689,65 @@ say yes to the merge, and delete the game folders you don't have.
 ---
 
 ## Changelog
+
+### v1.5
+
+- **Settings you change in the pause menu now stick.** They go into
+  `scriptdata\zpause.cfg` as the menu closes and are read back as the next match loads —
+  the same file the installer's config editor writes, so the menu, the installer, the
+  console and the file are all one set of settings. See
+  [Where settings are saved](#where-settings-are-saved).
+
+- **A zombie on its way in through a window carries on from where it was when the pause
+  ends.** The pause holds zombies with the engine freeze and, behind it, pins each one's
+  goal to where it stands. A zombie walking to a window is waiting to arrive at a goal of
+  its own, and the board tear that follows is played against the window itself — so a
+  goal at its feet reads as arrival, and one on its last steps in was put onto the window.
+  While the engine freeze holds it, a zombie that isn't through its window yet keeps the
+  goal the game gave it, which is how the game's own host-migration freeze holds it.
+
+- **`zp_freeze_players`** — set it to `0` and players can walk around a paused game with
+  their weapons down, and are locked again for the countdown back in. Players are still
+  locked by default, and roaming isn't recommended: doors, the box, perks, traps and
+  pickups can all still be used while the zombies are held.
+
+- **A settings menu for the host.** While the game is paused, hold **fire + melee** to
+  change ZPause's settings without the console: aim and fire move through the list,
+  grenade changes the setting, melee closes it. See
+  [The settings menu](#the-settings-menu); `zp_menu` turns it off.
+
+- **`none` empties a setting from the console.** `set zp_pause_sound ""` was put back to
+  its default the next time the config was read, so a silent sound or a downed combo left
+  on chat alone only ever worked from the installer. `none` does it from the console, a
+  config file or the settings menu.
+
+- **Changing `zp_engine_freeze` or `zp_godmode` during a pause** no longer leaves the
+  zombies frozen or the players invulnerable once it ends. Resuming undoes what the pause
+  did, rather than what the setting says by then.
+
+- **A settings menu in the lobby, in the mod version.** Pick **zm_pause** in the Mods menu
+  and the host gets a **ZPAUSE SETTINGS** button in the zombies lobby: every setting, a
+  page for each part, with what it does and its default beside it, and a reset. A change
+  there is kept in your player config, so it lasts until you change it back. See
+  [In the lobby](#in-the-lobby).
+
+- **More sounds to pick from.** `zp_pause_sound`, `zp_countdown_sound` and
+  `zp_resume_sound` each offer a few of the game's own zombies sounds as well as their
+  default and `none` — in the lobby, the pause menu and the installer alike.
+
+- **The countdown ticks on every map.** Its sound was `zmb_tombstone_timer_count`, which
+  only TranZit's and Nuketown's sound files carry, so the countdown was silent on Die
+  Rise, Mob of the Dead, Buried, Origins and in the Diner. It is now
+  `fly_equipment_pickup_plr`, the equipment pick-up sound, which every map has.
+
+- **The installer puts the right copy in each place.** Installing from a download put the
+  mod-folder copy in the two script paths as well, so the loose script called itself the
+  mod one and `zp_only_script` and `zp_only_mod` could not tell the copies apart.
+
+- **The installer's `-To` works when it already remembers a folder.** It was only read when
+  the installer had to ask where the game is, so once it remembered one, `-To` was ignored.
+  It comes first now, for that run, and a `-To` that is not the game's folder says so. On
+  Linux, the question itself now shows when more than one Plutonium folder is found, or none.
 
 ### v1.4
 

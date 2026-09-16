@@ -27,7 +27,8 @@
 #      ./install.sh --list              what is installed, then stop
 #      ./install.sh --configure         open the settings editor
 #      ./install.sh --game t8           skip the "which one?" question
-#      ./install.sh --to ~/Plutonium    skip the "where?" question
+#      ./install.sh --to ~/Plutonium    use this folder, even over a remembered one
+#      ./install.sh --zbundle           with --install --yes: add ZBundle on Black Ops II
 # ---------------------------------------------------------------------
 set -u
 
@@ -42,6 +43,7 @@ DO_UNINSTALL=0
 DO_LIST=0
 DO_CONFIGURE=0
 ASSUME_YES=0
+WANT_ZBUNDLE=0
 WANT_GAME=""
 WANT_TO=""
 while [ "$#" -gt 0 ]; do
@@ -53,9 +55,10 @@ while [ "$#" -gt 0 ]; do
         --configure|--settings) DO_CONFIGURE=1 ;;
         --yes|-y)    ASSUME_YES=1 ;;
         --no-colour|--no-color|--plain) PLAIN=1 ;;
+        --zbundle)   WANT_ZBUNDLE=1 ;;
         --game)      WANT_GAME="${2:-}"; shift ;;
         --to)        WANT_TO="${2:-}"; shift ;;
-        *) printf '\n  Not an option: %s\n  Try --find, --install, --uninstall, --list, --configure, --yes, --game, --to\n\n' "$1"; exit 1 ;;
+        *) printf '\n  Not an option: %s\n  Try --find, --install, --uninstall, --list, --configure, --yes, --zbundle, --game, --to\n\n' "$1"; exit 1 ;;
     esac
     shift
 done
@@ -568,10 +571,28 @@ choose_root() {  # choose_root <family> [force] -> CHOSEN
 declare -A ROOTS=()
 root_of() { printf '%s' "${ROOTS[$1]:-}"; }
 
+# The folder --to names, when it is one of this family's. It comes ahead of a
+# remembered folder, not only ahead of a question: root_ask goes through
+# root_quiet first, so a --to that was checked only where the question is
+# asked was never read at all once a folder had been remembered. It is
+# remembered in turn only when nothing valid is -- a --to for a second
+# install, or a test copy, should not quietly replace the folder every other
+# run uses.
+to_root() {  # to_root <family> -> prints the root --to names, or fails
+    [ -n "$WANT_TO" ] || return 1
+    settle_root "$1" "$WANT_TO"
+}
+
 root_quiet() {  # root_quiet <family> -> prints the root, without asking anybody
     local r saved
     r="${ROOTS[$1]:-}"
     [ -n "$r" ] && { printf '%s' "$r"; return 0; }
+    if r="$(to_root "$1")"; then
+        ROOTS[$1]="$r"
+        saved="$(setting "$1")"
+        { [ -n "$saved" ] && is_root "$1" "$saved"; } || set_setting "$1" "$r"
+        printf '%s' "$r"; return 0
+    fi
     saved="$(setting "$1")"
     if [ -n "$saved" ] && is_root "$1" "$saved"; then
         ROOTS[$1]="$saved"; printf '%s' "$saved"; return 0
@@ -585,22 +606,109 @@ root_quiet() {  # root_quiet <family> -> prints the root, without asking anybody
     return 1
 }
 
-root_ask() {  # root_ask <family> -> prints the root, asking if it must
+# Hands the folder back in ROOT_ASKED rather than printing it, and must not be
+# called inside $(...): the questions choose_root asks go to the screen, and
+# a subshell took them -- and whatever it remembered -- with it. Until 1.5 it
+# was, so a player with several Plutonium folders, or none found, answered a
+# question they could not see and got a folder with the question in its name.
+ROOT_ASKED=""
+root_ask() {  # root_ask <family> -> ROOT_ASKED, asking if it must
     local r
-    r="$(root_quiet "$1")" && { printf '%s' "$r"; return 0; }
+    ROOT_ASKED=""
+    # A --to that is not this game's folder is said out loud, by choose_root,
+    # rather than quietly swapped for a remembered one.
+    if [ -n "$WANT_TO" ] && ! to_root "$1" >/dev/null; then
+        find_roots "$1"
+        choose_root "$1" 0 || return 1
+    fi
+    if r="$(root_quiet "$1")"; then
+        ROOTS[$1]="$r"
+        ROOT_ASKED="$r"
+        return 0
+    fi
     find_roots "$1"
     choose_root "$1" 0 || return 1
     ROOTS[$1]="$CHOSEN"
     [ "$(setting "$1")" = "$CHOSEN" ] || set_setting "$1" "$CHOSEN"
-    printf '%s' "$CHOSEN"
+    ROOT_ASKED="$CHOSEN"
+}
+
+# The folder a path really is, through any symlink on the way. The longest
+# part of it that exists is resolved; the rest, which an install is about to
+# create, is kept as written.
+real_path() {  # real_path <path>
+    local d="$1" rest="" r
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -e "$d" ]; do
+        rest="/$(basename "$d")$rest"
+        d="$(dirname "$d")"
+    done
+    [ -d "$d" ] || { printf '%s' "$1"; return 0; }
+    r="$(cd -P "$d" 2>/dev/null && pwd -P)" || { printf '%s' "$1"; return 0; }
+    printf '%s%s' "$r" "$rest"
+}
+
+# Every folder beside a Black Ops III folder whose name starts with its name
+# -- the per-client copies a player can keep, "... BOIII", "... EzzBOIII",
+# "... T7x" -- as one row for each client a copy carries, into the COPY_*
+# arrays, saying whether that client's folder is its own or a link back into
+# the folder it sits beside. A copy that carries no client gets a row with an
+# empty client, so --find can say why nothing is installed there.
+#
+# It reads the disk and writes nothing. That is what lets --find use it:
+# --find promises to change nothing, and the table expansion that also uses
+# it runs after root_quiet, which may remember a folder.
+bo3_copies() {  # bo3_copies <folder>
+    COPY_NAME=(); COPY_PATH=(); COPY_TAG=(); COPY_CLIENT=(); COPY_REAL=(); COPY_OWN=()
+    local hub="${1:-}" parent leaf c tag cl any real hubs
+    [ -n "$hub" ] || return 0
+    parent="$(dirname "$hub")"; leaf="$(basename "$hub")"
+    [ -d "$parent" ] || return 0
+    for c in "$parent/$leaf"*; do
+        [ -d "$c" ] || continue
+        [ "$(basename "$c")" = "$leaf" ] && continue
+        tag="$(basename "$c")"; tag="${tag#"$leaf"}"
+        tag="${tag#"${tag%%[! _-]*}"}"
+        [ -n "$tag" ] || continue
+        any=0
+        # A client is there if its exe is or its folder is -- the same markers
+        # the game-folder slots use.
+        for cl in boiii t7x; do
+            [ -e "$c/$cl.exe" ] || [ -e "$c/$cl" ] || continue
+            any=1
+            real="$(real_path "$c/$cl")"; hubs="$(real_path "$hub/$cl")"
+            COPY_NAME+=("$(basename "$c")"); COPY_PATH+=("$c"); COPY_TAG+=("$tag")
+            COPY_CLIENT+=("$cl"); COPY_REAL+=("$real")
+            if [ "$real" != "$hubs" ]; then COPY_OWN+=(1); else COPY_OWN+=(0); fi
+        done
+        if [ "$any" -eq 0 ]; then
+            COPY_NAME+=("$(basename "$c")"); COPY_PATH+=("$c"); COPY_TAG+=("$tag")
+            COPY_CLIENT+=(""); COPY_REAL+=(""); COPY_OWN+=(0)
+        fi
+    done
 }
 
 if [ "$FINDONLY" -eq 1 ]; then
     for fam in pluto bo3 bo4; do
         head_ "${FAM_LABEL[$fam]}"
         find_roots "$fam"
-        if [ "${#FOUND[@]}" -eq 0 ]; then say "none found"
-        else for p in "${FOUND[@]}"; do say "$p"; done; fi
+        if [ "${#FOUND[@]}" -eq 0 ]; then say "none found"; continue; fi
+        for p in "${FOUND[@]}"; do
+            say "$p"
+            [ "$fam" = "bo3" ] || continue
+            # The per-client copies beside it, and whether each is an install
+            # target of its own. Without this, a machine with a folder per
+            # client reported one folder and gave no hint of the rest.
+            bo3_copies "$p"
+            for j in "${!COPY_NAME[@]}"; do
+                what="no client -- nothing installs here"
+                if [ -n "${COPY_CLIENT[$j]}" ] && [ "${COPY_OWN[$j]}" -eq 1 ]; then
+                    what="${COPY_CLIENT[$j]} -- its own, installed to separately"
+                elif [ -n "${COPY_CLIENT[$j]}" ]; then
+                    what="${COPY_CLIENT[$j]} -- shares this folder's"
+                fi
+                say "$(printf '    ... %-12s%s' "${COPY_TAG[$j]}" "$what")"
+            done
+        done
     done
     blank
     exit 0
@@ -619,38 +727,131 @@ fi
 # ------------------------------------------------- what is installed
 # Every place any of the five games can read ZPause from. Family says which
 # root the path hangs off. Kind says what the slot is: a file, a folder
-# (Black Ops 4 takes a whole mod folder), or a compiled file (T7x loads
-# compiled GSC and nothing else). Black Ops III's loaders are optional and
+# (Black Ops 4 takes a whole mod folder), a compiled file (T7x loads
+# compiled GSC and nothing else), or an asset -- a file the mod carries that
+# is not a script, like T6's lobby menu .iwd, which is copied and removed
+# but never read or configured. Black Ops III's loaders are optional and
 # independent, so a route there carries the marker that says whether that
 # loader is even present; the AppData route is judged by its own folder.
-SLOT_KEY=( t6 t6 t6 t5 t4 t7 t7 t7 t8 )
-SLOT_FAM=( pluto pluto pluto pluto pluto bo3 bo3 bo3 bo4 )
-SLOT_KIND=( file file file file file file file compiled folder )
-SLOT_GAME=("T6  Black Ops II" "T6  Black Ops II" "T6  mod version" \
+#
+# The three ZBundle slots are Black Ops II's ZPause and ZShare as one mod, for
+# a player who wants both from the Mods menu, where Plutonium enables one mod
+# at a time. Only the Treyarch bundle carries it, and it is offered rather
+# than written with everything else (see pick_zbundle). ZShare's script rides
+# as an asset: copied and removed with the ZPause script beside it.
+SLOT_KEY=( t6 t6 t6 t6 t6 t6 t6 t5 t4 t7 t7 t7 t7 t7 t8 )
+SLOT_FAM=( pluto pluto pluto pluto pluto pluto pluto pluto pluto bo3 bo3 bo3 bo3 bo3 bo4 )
+SLOT_KIND=( file file file asset file asset asset file file file file compiled folder folder folder )
+SLOT_GAME=("T6  Black Ops II" "T6  Black Ops II" "T6  mod version" "T6  mod lobby menu" \
+           "T6  ZBundle mod" "T6  ZBundle ZShare" "T6  ZBundle lobby menu" \
            "T5  Black Ops" "T4  World at War" \
            "T7  BOIII / Ezz BOIII" "T7  BOIII (Proton AppData)" "T7  T7x" \
+           "T7  BOIII lobby menu" "T7  T7x lobby menu" \
            "T8  Black Ops 4")
 SLOT_PATH=("storage/t6/raw/scripts/zm/zpause.gsc" \
            "storage/t6/scripts/zm/zpause.gsc" \
            "storage/t6/mods/zm_pause/scripts/zm/zpause.gsc" \
+           "storage/t6/mods/zm_pause/zpause.iwd" \
+           "storage/t6/mods/zm_zbundle/scripts/zm/zpause.gsc" \
+           "storage/t6/mods/zm_zbundle/scripts/zm/zshare.gsc" \
+           "storage/t6/mods/zm_zbundle/zpause.iwd" \
            "storage/t5/raw/scripts/sp/zpause.gsc" \
            "storage/t4/raw/scripts/sp/zpause.gsc" \
            "boiii/custom_scripts/zpause.gsc" \
            "custom_scripts/zpause.gsc" \
            "t7x/custom_scripts/zpause.gsc" \
+           "boiii/ui_scripts/zpause" \
+           "t7x/ui_scripts/zpause" \
            "project-bo4/mods/zpause")
-# A base of "-" means the family root; "appdata" means the BOIII prefix.
-SLOT_BASE=( - - - - - - appdata - - )
-SLOT_MARK=( - - - - - "boiii.exe boiii" "" "t7x.exe t7x" - )
-SLOT_NOTE=("" "" "" "" "" "loose script, no mod slot" \
-           "the same client, its other script folder" "compiled build, no mod slot" "")
+# A base of "-" means the family root, "appdata" the BOIII prefix, and
+# anything else is a folder of its own -- see bo3_expand().
+SLOT_BASE=( - - - - - - - - - - appdata - - - - )
+# What a folder slot is made of: "-" is the Black Ops 4 mod shape, "lua" the
+# lobby menu's folder of Lua. See slot_files_ok(). The menu is game folder
+# only: a client's own data folder is pruned on launch.
+SLOT_FILES=( - - - - - - - - - - - - lua lua - )
+# Which slots are extras, offered on their own rather than installed with the
+# rest: "-" for none.
+SLOT_EXTRA=( - - - - zbundle zbundle zbundle - - - - - - - - )
+SLOT_MARK=( - - - - - - - - - "boiii.exe boiii" "" "t7x.exe t7x" "boiii.exe boiii" "t7x.exe t7x" - )
+SLOT_NOTE=("" "" "" "" "" "" "" "" "" "loose script, no mod slot" \
+           "original BOIII's other script folder -- Ezz BOIII clears it on launch" "compiled build, no mod slot" \
+           "the lobby settings menu" "the lobby settings menu" "")
 
 slot_base() {  # slot_base <i>
     case "${SLOT_BASE[$1]}" in
         appdata) printf '%s' "$APPDATA" ;;
-        *) root_quiet "${SLOT_FAM[$1]}" ;;
+        -) root_quiet "${SLOT_FAM[$1]}" ;;
+        *) printf '%s' "${SLOT_BASE[$1]}" ;;
     esac
 }
+
+# What a folder slot is made of, and the file whose being there means it is
+# installed at all. Both were the Black Ops 4 mod folder's shape written into
+# three separate places, which is what made kind "folder" mean "a Black Ops 4
+# mod" rather than "a folder of ours". SLOT_FILES names the shape: "-" is
+# that mod, "lua" a folder of Lua.
+slot_files_ok() {  # slot_files_ok <i> <path>
+    case "${SLOT_FILES[$1]:-}" in
+        lua) case "$2" in *.lua) return 0 ;; esac ;;
+        *)   case "$2" in *.json|*.gscc|*.gsic|*.luac) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+slot_marker() {  # slot_marker <i>
+    case "${SLOT_FILES[$1]:-}" in
+        lua) printf '__init__.lua' ;;
+        *)   printf 'metadata.json' ;;
+    esac
+}
+
+# One Black Ops III folder per client.
+#
+# A player can keep a copy of the game for each client -- "... BOIII",
+# "... EzzBOIII", "... T7x" beside the plain folder -- and the slots above
+# reach only the one folder the family resolved to. Most copies link their
+# boiii/ and t7x/ back to it, so writing there already reaches them. A copy
+# that does not is an install target of its own that nothing above would ever
+# write to: Ezz BOIII's carries no boiii/ at all, and prunes its whole data
+# folder on launch, so its own game folder is the only place ZPause survives.
+#
+# So every folder beside that one whose name starts with its name, and that
+# holds a client's exe, gets the game-folder slots again with a base of its
+# own, which slot_base() hands straight back. A client folder that resolves
+# to one already covered is a link and is left out, which is what keeps a
+# machine with one copy exactly as it was.
+bo3_expand() {
+    local hub j i key suffix room label n
+    hub="$(root_quiet bo3)" || return 0
+    bo3_copies "$hub"
+    [ "${#COPY_NAME[@]}" -gt 0 ] || return 0
+    # The table as it stands before any copy is added: the loop below appends
+    # to it, and must not walk its own additions.
+    n="${#SLOT_PATH[@]}"
+    local -A seen=()
+    for j in "${!COPY_NAME[@]}"; do
+        [ -n "${COPY_CLIENT[$j]}" ] && [ "${COPY_OWN[$j]}" -eq 1 ] || continue
+        # Two copies whose client folders are one folder are one target.
+        key="${COPY_REAL[$j]}"
+        [ -n "${seen[$key]:-}" ] && continue
+        seen["$key"]=1
+        for ((i = 0; i < n; i++)); do
+            [ "${SLOT_FAM[$i]}" = "bo3" ] && [ "${SLOT_BASE[$i]}" = "-" ] || continue
+            # A game-folder slot belongs to the client its path starts with.
+            [ "${SLOT_PATH[$i]%%/*}" = "${COPY_CLIENT[$j]}" ] || continue
+            # The label column is 24 wide on every screen that shows one.
+            suffix=""; [ "${SLOT_KIND[$i]}" = "folder" ] && suffix=" lobby menu"
+            room=$((24 - 4 - ${#suffix}))
+            label="T7  ${COPY_TAG[$j]:0:$room}$suffix"
+            SLOT_KEY+=("${SLOT_KEY[$i]}"); SLOT_FAM+=(bo3); SLOT_KIND+=("${SLOT_KIND[$i]}")
+            SLOT_GAME+=("$label"); SLOT_PATH+=("${SLOT_PATH[$i]}"); SLOT_BASE+=("${COPY_PATH[$j]}")
+            SLOT_FILES+=("${SLOT_FILES[$i]}"); SLOT_MARK+=("${SLOT_MARK[$i]}"); SLOT_EXTRA+=(-)
+            SLOT_NOTE+=("${SLOT_NOTE[$i]}, in ${COPY_NAME[$j]}")
+        done
+    done
+}
+bo3_expand
 slot_path() {  # slot_path <i>
     local b
     b="$(slot_base "$1")" || return 1
@@ -658,13 +859,16 @@ slot_path() {  # slot_path <i>
     printf '%s/%s' "$b" "${SLOT_PATH[$1]}"
 }
 slot_present() {  # slot_present <i> -- is that loader even installed?
-    local b m r
+    local b m
     [ "${SLOT_MARK[$1]}" = "-" ] && return 0
     b="$(slot_base "$1")" || return 1
     [ -n "$b" ] || return 1
     if [ -z "${SLOT_MARK[$1]}" ]; then [ -d "$b" ]; return $?; fi
-    r="$(root_quiet "${SLOT_FAM[$1]}")" || return 1
-    for m in ${SLOT_MARK[$1]}; do [ -e "$r/$m" ] && return 0; done
+    # Against the slot's own base, not the family's root: a slot that names
+    # its own base -- BOIII's AppData script folder, and the lobby menu's
+    # folders after it -- would otherwise be judged by whether a marker sat
+    # in the game folder, which is a different place entirely.
+    for m in ${SLOT_MARK[$1]}; do [ -e "$b/$m" ] && return 0; done
     return 1
 }
 
@@ -678,8 +882,20 @@ slot_version() {  # slot_version <i> <full path> -> version, or nothing if absen
     if [ "${SLOT_KIND[$1]}" = "folder" ]; then
         # What the mod folder holds is compiled, so nothing in it says which
         # version it is. The stamp the installer wrote does.
-        [ -f "$2/metadata.json" ] || return 1
+        [ -f "$2/$(slot_marker "$1")" ] || return 1
         if [ -f "$2/zpause.installed" ]; then head -n 1 "$2/zpause.installed"; else printf '?'; fi
+        return 0
+    fi
+    if [ "${SLOT_KIND[$1]}" = "asset" ]; then
+        # Nothing inside it says which version it is. It installs with the
+        # mod copy of the script beside it, so it goes by that one -- a
+        # folder up from the lobby menu, or in the same folder as ZBundle's
+        # ZShare script.
+        [ -f "$2" ] || return 1
+        v="$(read_version "$(dirname "$2")/scripts/zm/zpause.gsc")" || v=""
+        [ -n "$v" ] || { v="$(read_version "$(dirname "$2")/zpause.gsc")" || v=""; }
+        [ -n "$v" ] || v="?"
+        printf '%s' "$v"
         return 0
     fi
     [ -f "$2" ] || return 1
@@ -698,21 +914,26 @@ slot_version() {  # slot_version <i> <full path> -> version, or nothing if absen
 
 INST_KEY=(); INST_FAM=(); INST_KIND=(); INST_GAME=(); INST_PATH=(); INST_VER=()
 get_installed() {
-    INST_KEY=(); INST_FAM=(); INST_KIND=(); INST_GAME=(); INST_PATH=(); INST_VER=()
+    INST_KEY=(); INST_FAM=(); INST_KIND=(); INST_GAME=(); INST_PATH=(); INST_VER=(); INST_SLOT=()
     local i full v
     for i in "${!SLOT_PATH[@]}"; do
         full="$(slot_path "$i")" || continue
         v="$(slot_version "$i" "$full")" || continue
         INST_KEY+=("${SLOT_KEY[$i]}"); INST_FAM+=("${SLOT_FAM[$i]}"); INST_KIND+=("${SLOT_KIND[$i]}")
-        INST_GAME+=("${SLOT_GAME[$i]}"); INST_PATH+=("$full"); INST_VER+=("$v")
+        INST_GAME+=("${SLOT_GAME[$i]}"); INST_PATH+=("$full"); INST_VER+=("$v"); INST_SLOT+=("$i")
     done
 }
 
 short_path() {  # short_path <i into INST_*>
+    # The separator matters: "Call of Duty Black Ops III" is a proper prefix
+    # of "Call of Duty Black Ops III T7x" and of every other per-client copy
+    # beside it, so without it a path in a sibling folder shortens to one
+    # that reads as being inside the original.
     local b
     b="$(root_of "${INST_FAM[$1]}")"
+    b="${b%/}"
     if [ -n "$b" ]; then
-        case "${INST_PATH[$1]}" in "$b"*) printf '...%s' "${INST_PATH[$1]#$b}"; return 0 ;; esac
+        case "${INST_PATH[$1]}" in "$b"/*) printf '...%s' "${INST_PATH[$1]#$b}"; return 0 ;; esac
     fi
     printf '%s' "${INST_PATH[$1]}"
 }
@@ -736,7 +957,7 @@ show_installed() {
         note="v${INST_VER[$i]}"
         edited=0
         if [ "${INST_KIND[$i]}" != "folder" ]; then
-            known="$(ref_for "${INST_VER[$i]}" "${INST_KEY[$i]}" "${INST_KIND[$i]}")"
+            known="$(ref_for "${INST_VER[$i]}" "${INST_KEY[$i]}" "${INST_KIND[$i]}" "${INST_PATH[$i]}")"
             if [ -n "$known" ] && ! cmp -s "$known" "${INST_PATH[$i]}"; then edited=1; fi
         fi
         if [ "$edited" -eq 1 ]; then
@@ -1276,7 +1497,7 @@ PLAN_FROM=(); PLAN_TO=()
 PICKED=()
 install_plan() {  # install_plan <key> -> PLAN_FROM / PLAN_TO / PLAN_KIND
     PLAN_FROM=(); PLAN_TO=(); PLAN_KIND=()
-    local key="$1" i to src f from inTree flat
+    local key="$1" i to src f from
     for i in "${!SLOT_PATH[@]}"; do
         [ "${SLOT_KEY[$i]}" = "$key" ] || continue
         [ "${PICKED[$i]:-0}" = "1" ] || continue
@@ -1287,25 +1508,22 @@ install_plan() {  # install_plan <key> -> PLAN_FROM / PLAN_TO / PLAN_KIND
                 [ -f "$f" ] || continue
                 # Only what the mod is made of. A README sitting beside the
                 # payload in a source folder is not part of it.
-                case "$f" in *.json|*.gscc|*.gsic|*.luac) ;; *) continue ;; esac
+                slot_files_ok "$i" "$f" || continue
                 PLAN_FROM+=("$f"); PLAN_TO+=("$to/$(basename "$f")"); PLAN_KIND+=(file)
             done
             PLAN_FROM+=(""); PLAN_TO+=("$to/zpause.installed"); PLAN_KIND+=(stamp)
             continue
         fi
+        if [ "${SLOT_EXTRA[$i]:--}" != "-" ]; then
+            from="$(extra_payload "$i")" || continue
+            PLAN_FROM+=("$from"); PLAN_TO+=("$to"); PLAN_KIND+=("${SLOT_KIND[$i]}")
+            continue
+        fi
         from="$(payload_for "$key" "${SLOT_KIND[$i]}")" || continue
         [ -n "$from" ] || continue
-        # T6's mod-folder copy is a generated variant of the same script,
-        # differing only in what zp_origin() returns. A download carries it
-        # at its own path already; a source folder has it lying beside the
-        # loose one, so pick it up here or the mod slot gets a copy that
-        # calls itself the script one.
-        case "${SLOT_PATH[$i]}" in
-            *mods/zm_pause*)
-                inTree="${ROOT:-}/Plutonium/${SLOT_PATH[$i]}"
-                flat="$(dirname "$from")/zpause_mod.gsc"
-                if [ -f "$inTree" ]; then from="$inTree"
-                elif [ -f "$flat" ]; then from="$flat"; fi ;;
+        # T6's mod-folder copy is a variant of the same script; see mod_copy.
+        case "${SLOT_KIND[$i]}:${SLOT_PATH[$i]}" in
+            file:*mods/zm_pause*) from="$(mod_copy "${ROOT:-}" "$from" "$key")" ;;
         esac
         PLAN_FROM+=("$from"); PLAN_TO+=("$to"); PLAN_KIND+=("${SLOT_KIND[$i]}")
     done
@@ -1350,12 +1568,58 @@ pick_install_game() {  # -> PICK_KEY, from GAMES_HERE, --game, or a question
     PICK_KEY="${G_KEY[$((c - 1))]}"
 }
 
+# Where an extra's file is inside the Treyarch bundle: at the path it installs
+# to, under the download's Plutonium folder. Nothing else carries one, so
+# anywhere else this answers nothing and the extra is not offered.
+extra_payload() {  # extra_payload <i>
+    local p
+    [ -n "${ROOT:-}" ] || return 1
+    [ "${SLOT_EXTRA[$1]:--}" != "-" ] || return 1
+    p="$ROOT/Plutonium/${SLOT_PATH[$1]}"
+    [ -f "$p" ] || return 1
+    printf '%s' "$p"
+}
+
+# ZBundle is asked about, not assumed: it is a second Black Ops II mod, and
+# most players want one or the other. Already installed, the answer defaults
+# to yes, so an update keeps it in step with the ZPause beside it; --yes
+# takes that default, and --zbundle says yes outright.
+pick_zbundle() {  # pick_zbundle <key> -- sets PICKED for the ZBundle slots
+    local key="$1" i extras=() have=0 want=0 zs="" full p d
+    for i in "${!SLOT_PATH[@]}"; do
+        [ "${SLOT_KEY[$i]}" = "$key" ] || continue
+        [ "${SLOT_EXTRA[$i]:--}" = "zbundle" ] || continue
+        extra_payload "$i" >/dev/null || continue
+        extras+=("$i")
+        full="$(slot_path "$i")" && [ -f "$full" ] && have=1
+        case "${SLOT_PATH[$i]}" in
+            *zshare.gsc)
+                p="$(extra_payload "$i")"
+                zs="$(head -n 40 "$p" | sed -n 's/.*ZSHARE v\([0-9][0-9.]*d\?\).*/\1/p' | head -n 1)" ;;
+        esac
+    done
+    [ "${#extras[@]}" -gt 0 ] || return 0
+    { [ "$WANT_ZBUNDLE" -eq 1 ] || [ "$have" -eq 1 ]; } && want=1
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        [ -n "$zs" ] && zs=" v$zs"
+        blank
+        say "This download also carries ZBundle: ZPause and ZShare$zs as one mod,"
+        say "for playing both from the Mods menu. It goes in mods/zm_zbundle, beside"
+        say "zm_pause, and does nothing until you pick zm_zbundle there."
+        d="n"; [ "$want" -eq 1 ] && d="y"
+        if ask "Install ZBundle as well?" "$d"; then want=1; else want=0; fi
+    fi
+    for i in "${extras[@]}"; do PICKED[$i]="$want"; done
+}
+
 pick_routes() {  # pick_routes <key> -> PICKED; returns 1 if nothing is ticked
     local key="$1" i box c n any=0
     PICKED=()
     for i in "${!SLOT_PATH[@]}"; do
-        [ "${SLOT_KEY[$i]}" = "$key" ] && PICKED[$i]=1
+        [ "${SLOT_KEY[$i]}" = "$key" ] || continue
+        if [ "${SLOT_EXTRA[$i]:--}" = "-" ]; then PICKED[$i]=1; else PICKED[$i]=0; fi
     done
+    pick_zbundle "$key"
     [ "$key" = "t7" ] || return 0
 
     # Black Ops III has three loaders, all optional and all independent, so
@@ -1434,7 +1698,25 @@ do_install() {  # do_install [1 to skip the confirmation] [key]
             case " ${GAMES_HERE[*]-} " in *" $key "*) ;; *) say "Still nothing to install."; return 0 ;; esac ;;
     esac
 
-    root="$(root_ask "$fam")" || { blank; say "Nothing changed."; return 0; }
+    # A route that names its own base needs no game folder at all. BOIII's
+    # AppData script folder is one, and on Ezz BOIII -- which carries no
+    # boiii/ of its own -- it is the only route there is. Stopping here
+    # refused an install that had somewhere perfectly good to go.
+    if root_ask "$fam"; then
+        root="$ROOT_ASKED"
+    else
+        local own=0 ob
+        root=""
+        for i in "${!SLOT_KEY[@]}"; do
+            [ "${SLOT_KEY[$i]}" = "$key" ] || continue
+            [ "${SLOT_BASE[$i]}" = "-" ] && continue
+            ob="$(slot_base "$i")" || continue
+            [ -n "$ob" ] && [ -d "$ob" ] && own=1
+        done
+        [ "$own" -eq 1 ] || { blank; say "Nothing changed."; return 0; }
+        blank
+        say "No game folder found -- carrying on with the routes that do not need one."
+    fi
 
     already=""
     get_installed
@@ -1468,7 +1750,7 @@ do_install() {  # do_install [1 to skip the confirmation] [key]
     for i in "${!PLAN_TO[@]}"; do
         [ "${PLAN_KIND[$i]}" = "stamp" ] && continue
         show="${PLAN_TO[$i]}"
-        case "$show" in "$root"/*) show="${show#$root/}" ;; esac
+        [ -n "$root" ] && case "$show" in "$root"/*) show="${show#$root/}" ;; esac
         say "    $show"
     done
     blank
@@ -1506,6 +1788,13 @@ do_install() {  # do_install [1 to skip the confirmation] [key]
     else
         say "Installed $n file(s)."
     fi
+    for i in "${!PLAN_TO[@]}"; do
+        case "${PLAN_TO[$i]}" in
+            */mods/zm_zbundle/*)
+                say "ZBundle is in mods/zm_zbundle -- pick zm_zbundle in the Mods menu to run it."
+                break ;;
+        esac
+    done
     reapply_config
     if [ "$fam" = "bo4" ]; then
         say "Only the host needs ZPause. Start a zombies match to load it."
@@ -1583,7 +1872,8 @@ do_uninstall() {  # do_uninstall [1 to take everything without asking which]
             # stays: it is not ours to delete, and an empty one costs nothing.
             for f in "${INST_PATH[$i]}"/*; do
                 [ -f "$f" ] || continue
-                case "$f" in *.json|*.gscc|*.gsic|*.luac|*.installed) ;; *) continue ;; esac
+                slot_files_ok "${INST_SLOT[$i]}" "$f" ||
+                    case "$f" in *.installed) ;; *) continue ;; esac
                 backup_file "$f"
                 if rm -f "$f"; then log "removed" "$f"; n=$((n + 1)); fi
             done
@@ -1804,7 +2094,32 @@ first_script() {  # first_script <dir or file>
     [ -n "${1:-}" ] || return 0
     [ -f "$1" ] && { printf '%s' "$1"; return 0; }
     [ -d "$1" ] || return 0
-    find "$1" -type f -name '*.gsc' 2>/dev/null | sort | head -n 1
+    # A loose script before one in a mod folder. T6's download carries both,
+    # and the mod copy is the variant that calls itself the mod one: found
+    # first, it went into the two loose slots as well, and whichever copy
+    # the game ran said it was the mod.
+    local all one
+    all="$(CDPATH= cd -- "$1" 2>/dev/null && find . -type f -name '*.gsc' 2>/dev/null | sort)"
+    [ -n "$all" ] || return 0
+    one="$(printf '%s\n' "$all" | grep -v '^\./mods/' | head -n 1)"
+    [ -n "$one" ] || one="$(printf '%s\n' "$all" | head -n 1)"
+    printf '%s' "$1/${one#./}"
+}
+
+# T6's mod-folder copy: a generated variant of the same script, differing
+# only in what zp_origin() returns. A download carries it at its own path, a
+# source folder beside the loose one as zpause_mod.gsc. The install and the
+# "does this match its version" check both take it from here, or the mod
+# slot gets a copy that calls itself the script one -- or reads as edited
+# against one.
+mod_copy() {  # mod_copy <root> <loose script> <key>
+    local inTree="${1:-}/Plutonium/storage/$3/mods/zm_pause/scripts/zm/zpause.gsc" flat
+    if [ -n "${1:-}" ] && [ -f "$inTree" ]; then printf '%s' "$inTree"; return 0; fi
+    if [ -n "${2:-}" ]; then
+        flat="$(dirname "$2")/zpause_mod.gsc"
+        [ -f "$flat" ] && { printf '%s' "$flat"; return 0; }
+    fi
+    printf '%s' "${2:-}"
 }
 
 # Where a game's files are inside a download or a source folder. A download
@@ -1818,6 +2133,12 @@ payload_in() {  # payload_in <root> <key> <kind>
     [ -n "$root" ] || return 1
     case "$key" in
         t6|t5|t4)
+            if [ "$kind" = "asset" ]; then
+                [ -f "$root/Plutonium/storage/$key/mods/zm_pause/zpause.iwd" ] &&
+                    { printf '%s' "$root/Plutonium/storage/$key/mods/zm_pause/zpause.iwd"; return 0; }
+                [ "$REL_GAME" = "$key" ] && [ -f "$root/zpause.iwd" ] && { printf '%s' "$root/zpause.iwd"; return 0; }
+                return 1
+            fi
             one="$(first_script "$root/Plutonium/storage/$key")"
             [ -n "$one" ] && { printf '%s' "$one"; return 0; }
             [ "$REL_GAME" = "$key" ] && [ -f "$root/zpause.gsc" ] && { printf '%s' "$root/zpause.gsc"; return 0; }
@@ -1828,6 +2149,19 @@ payload_in() {  # payload_in <root> <key> <kind>
                 [ -f "$root/zpause_t7x.gscc" ] && { printf '%s' "$root/zpause_t7x.gscc"; return 0; }
                 return 1
             fi
+            # The lobby menu: one folder of Lua that every ui_scripts slot
+            # installs from, in a download or beside the script in src/.
+            if [ "$kind" = "folder" ]; then
+                [ -f "$root/Black Ops III/boiii/ui_scripts/zpause/__init__.lua" ] &&
+                    { printf '%s' "$root/Black Ops III/boiii/ui_scripts/zpause"; return 0; }
+                [ -f "$root/ui_scripts/zpause/__init__.lua" ] &&
+                    { printf '%s' "$root/ui_scripts/zpause"; return 0; }
+                return 1
+            fi
+            # Anything else asked for here has nothing to hand back. Falling
+            # through to the script below gave a Lua folder slot zpause.gsc as
+            # its source.
+            [ "$kind" = "file" ] || return 1
             [ -f "$root/Black Ops III/boiii/custom_scripts/zpause.gsc" ] &&
                 { printf '%s' "$root/Black Ops III/boiii/custom_scripts/zpause.gsc"; return 0; }
             [ "$REL_GAME" = "t7" ] && [ -f "$root/zpause.gsc" ] && { printf '%s' "$root/zpause.gsc"; return 0; }
@@ -1879,19 +2213,32 @@ is_applied() {  # is_applied <path>
     grep -Fqx "$1|$h" "$APPLIED" 2>/dev/null
 }
 
-ref_for() {  # ref_for <version> <key> [kind] -- a known-good copy, if we have one
+ref_for() {  # ref_for <version> <key> [kind] [installed path] -- a known-good copy, if we have one
     # Keyed by game as well as version: inside the bundle every game shares
-    # a version, and the first script found was the wrong game's.
-    local v="${1:-}" key="${2:-}" kind="${3:-file}" i one ck
+    # a version, and the first script found was the wrong game's. And by
+    # copy: an installed path in T6's mod folder is held up against the mod
+    # variant, not the loose script it differs from by a line.
+    local v="${1:-}" key="${2:-}" kind="${3:-file}" path="${4:-}" i one ck mod="" zshare=""
     [ -n "$v" ] && [ "$v" != "?" ] || return 0
-    ck="$v|$key|$kind"
+    # ZBundle's ZPause script is the same mod variant as zm_pause's, and its
+    # lobby menu the same .iwd. Its ZShare script is nobody else's, so that
+    # one is held up against ZBundle's own copy in the download.
+    case "$kind:$path" in file:*/mods/zm_pause/*|file:*/mods/zm_zbundle/*) mod="mod" ;; esac
+    case "$path" in */mods/zm_zbundle/*/zshare.gsc) zshare="zshare" ;; esac
+    ck="$v|$key|$kind|$mod|$zshare"
     if [ "$ck" = "$REF_VER" ]; then printf '%s' "$REF_PATH"; return 0; fi
     REF_VER="$ck"; REF_PATH=""
     get_choices
     if [ "${#CH_DIR[@]}" -gt 0 ]; then
         for i in "${!CH_DIR[@]}"; do
             [ "${CH_VER[$i]}" = "$v" ] || continue
+            if [ -n "$zshare" ]; then
+                one="${CH_DIR[$i]}/Plutonium/storage/$key/mods/zm_zbundle/scripts/zm/zshare.gsc"
+                [ -f "$one" ] && { REF_PATH="$one"; break; }
+                continue
+            fi
             one="$(payload_in "${CH_DIR[$i]}" "$key" "$kind")" || continue
+            [ -n "$one" ] && [ -n "$mod" ] && one="$(mod_copy "${CH_DIR[$i]}" "$one" "$key")"
             [ -n "$one" ] && { REF_PATH="$one"; break; }
         done
     fi
@@ -2065,6 +2412,14 @@ do_doctor() {
                         break ;;
                 esac
             done
+            for i in "${!INST_PATH[@]}"; do
+                case "${INST_PATH[$i]}" in
+                    */mods/zm_zbundle/*)
+                        doc_note "ZBundle is present. It does nothing unless zm_zbundle is picked in the"
+                        doc_note "      in-game Mods menu, where it runs ZPause and ZShare together."
+                        break ;;
+                esac
+            done
         fi
     done
 
@@ -2073,7 +2428,7 @@ do_doctor() {
     for i in "${!INST_PATH[@]}"; do
         [ "${INST_VER[$i]}" = "?" ] && doc_warn "Cannot read a version out of ${INST_PATH[$i]}"
         [ "${INST_KIND[$i]}" = "folder" ] && continue
-        known="$(ref_for "${INST_VER[$i]}" "${INST_KEY[$i]}" "${INST_KIND[$i]}")"
+        known="$(ref_for "${INST_VER[$i]}" "${INST_KEY[$i]}" "${INST_KIND[$i]}" "${INST_PATH[$i]}")"
         if [ -n "$known" ] && ! cmp -s "$known" "${INST_PATH[$i]}" &&
            ! is_applied "${INST_PATH[$i]}"; then
             edited=$((edited + 1))
@@ -2608,10 +2963,15 @@ dv_type() {  # dv_type <name>
     printf 'str'
 }
 
-load_config() {  # load_config <game>
+# A cfg of `set name "value"` lines, into CFGV. The saved profile and the
+# game's own settings file are the same format on purpose -- the script
+# writes one the editor can read, and the editor writes one the script can
+# read -- so both come through here.
+parse_cfg() {  # parse_cfg <file>
     CFGV=()
     local f line name val
-    f="$(config_file "$1")"
+    f="$1"
+    [ -n "$f" ] || return 0
     [ -f "$f" ] || return 0
     while IFS= read -r line; do
         case "$line" in ''|//*) continue ;; esac
@@ -2621,6 +2981,27 @@ load_config() {  # load_config <game>
         val="${val%\"}"; val="${val#\"}"
         CFGV[$name]="$val"
     done < "$f"
+}
+
+load_config() {  # load_config <game>
+    parse_cfg "$(config_file "$1")"
+}
+
+# What the game is actually running.
+#
+# The Plutonium games keep their settings in a file of their own that the
+# script reads as a match loads and the in-game menu rewrites when it
+# closes, so it -- not the saved profile -- is what is in force. The editor
+# shows it and the re-apply after an install leaves it alone, which is what
+# stops a setting changed in the pause menu from being quietly thrown away
+# by a profile saved weeks ago. Black Ops 4 does the same with two files,
+# the in-game menu's and the lobby menu's.
+live_values() {  # live_values <game>
+    if [ "$1" = "t8" ]; then
+        read_bo4_values
+        return 0
+    fi
+    parse_cfg "$(pluto_cfg_home "$1")"
 }
 
 cfg_text() {  # cfg_text <game>
@@ -2662,6 +3043,7 @@ apply_to_scripts() {  # apply_to_scripts <game> -- returns the count via APPLIED
     for i in "${!SLOT_PATH[@]}"; do
         [ "${SLOT_KEY[$i]}" = "$1" ] || continue
         [ "${SLOT_KIND[$i]}" = "folder" ] && continue
+        [ "${SLOT_KIND[$i]}" = "asset" ] && continue
         f="$(slot_path "$i")" || continue
         [ -f "$f" ] || continue
         if [ "${SLOT_KIND[$i]}" = "compiled" ] || is_compiled "$f"; then
@@ -2732,6 +3114,37 @@ cfg_home() {  # cfg_home <game>
     esac
 }
 
+# Where the Plutonium games read their settings from, and the reason this
+# is a different path from the exported cfg above.
+#
+# Plutonium's file functions are rooted at the game's own scriptdata
+# folder, so that is the one place the script, the in-game settings menu
+# and this editor can all reach. The script reads it as a match loads; the
+# menu rewrites it when it closes. That is what makes a change made in any
+# one of the three turn up in the other two.
+#
+# Written on every apply, not only on export, because the script takes it
+# ahead of the defaults written into the script itself -- a stale copy left
+# behind would quietly outrank the change just made here.
+pluto_cfg_home() {  # pluto_cfg_home <game>
+    local r
+    [ "${GAME_FAM[$1]}" = "pluto" ] || return 1
+    r="$(root_quiet pluto)" || return 1
+    printf '%s/storage/%s/raw/scriptdata/zpause.cfg' "$r" "$1"
+}
+
+write_pluto_cfg() {  # write_pluto_cfg <game> -> PLUTO_CFG
+    PLUTO_CFG=""
+    local out dir
+    out="$(pluto_cfg_home "$1")" || return 0
+    [ -n "$out" ] || return 0
+    dir="$(dirname "$out")"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    cfg_text "$1" > "$out" 2>/dev/null || return 0
+    log "exported" "$out"
+    PLUTO_CFG="$out"
+}
+
 # Black Ops 4 reads its settings from a JSON file at load: a list of
 # { name, value } objects, not one object of pairs, because Shield turns a
 # JSON object into a script struct whose fields can only be read by a name
@@ -2776,6 +3189,92 @@ write_json_values() {  # -> JSON_N: settings written, 0 if all default, -1 on fa
     return 0
 }
 
+# The lobby menu's file, beside that one. The lobby writes a key per setting
+# as it is changed and reads them back into the dvars as the game starts, and
+# a dvar outranks zpause.json -- so this is written on every apply as well,
+# with the same values, or a change made here would be undone by an older
+# one chosen in the lobby. One object of strings, because that is what
+# Shield's readjson and writejson read and write.
+lobby_json_home() {
+    local r
+    r="$(root_quiet bo4)" || return 1
+    printf '%s/project-bo4/saved/server/zpause_lobby.json' "$r"
+}
+
+write_lobby_json() {
+    local f dir i name def val p parts=() first=1
+    f="$(lobby_json_home)" || return 0
+    for i in "${!DV_NAME[@]}"; do
+        name="${DV_NAME[$i]}"; def="${DV_DEF[$i]}"
+        [ -n "${CFGV[$name]+x}" ] || continue
+        val="${CFGV[$name]}"
+        [ "$val" = "$def" ] && continue
+        parts+=("    \"$name\": \"${val//\"/\\\"}\"")
+    done
+    if [ "${#parts[@]}" -eq 0 ]; then
+        if [ -f "$f" ]; then backup_file "$f"; rm -f "$f"; log "removed" "$f"; fi
+        return 0
+    fi
+    dir="$(dirname "$f")"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    backup_file "$f"
+    {
+        printf '{\n'
+        for p in "${parts[@]}"; do
+            [ "$first" -eq 1 ] || printf ',\n'
+            first=0
+            printf '%s' "$p"
+        done
+        printf '\n}\n'
+    } > "$f" || return 0
+    log "configured" "$f"
+}
+
+# What Black Ops 4 is running, from both files, into CFGV: zpause.json --
+# which the installer writes as { name, value } and the in-game menu as
+# [ name, value ] -- with the lobby's file over it, since the lobby's values
+# go into the dvars. An empty value there is a setting put back to DEFAULT in
+# the lobby, which leaves zpause.json's in force.
+read_bo4_values() {
+    CFGV=()
+    local f text line
+    f="$(json_home)" || f=""
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        text="$(tr '\r\n' '  ' < "$f")"
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            CFGV[${line%%=*}]="${line#*=}"
+        done < <(printf '%s' "$text" |
+            grep -oE '"name"[[:space:]]*:[[:space:]]*"zp_[a-z0-9_]+"[[:space:]]*,[[:space:]]*"value"[[:space:]]*:[[:space:]]*("[^"]*"|[^,}[:space:]]+)' |
+            sed -E 's/^"name"[[:space:]]*:[[:space:]]*"(zp_[a-z0-9_]+)"[[:space:]]*,[[:space:]]*"value"[[:space:]]*:[[:space:]]*"?([^"]*)"?$/\1=\2/')
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            CFGV[${line%%=*}]="${line#*=}"
+        done < <(printf '%s' "$text" |
+            grep -oE '\[[[:space:]]*"zp_[a-z0-9_]+"[[:space:]]*,[[:space:]]*"[^"]*"[[:space:]]*\]' |
+            sed -E 's/^\[[[:space:]]*"(zp_[a-z0-9_]+)"[[:space:]]*,[[:space:]]*"([^"]*)"[[:space:]]*\]$/\1=\2/')
+        # What the in-game menu's pairs actually look like: Shield writes a
+        # script array as an object of "0", "1" keys under "$.type": "array".
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            CFGV[${line%%=*}]="${line#*=}"
+        done < <(printf '%s' "$text" |
+            grep -oE '"0"[[:space:]]*:[[:space:]]*"zp_[a-z0-9_]+"[[:space:]]*,[[:space:]]*"1"[[:space:]]*:[[:space:]]*"[^"]*"' |
+            sed -E 's/^"0"[[:space:]]*:[[:space:]]*"(zp_[a-z0-9_]+)"[[:space:]]*,[[:space:]]*"1"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1=\2/')
+    fi
+    f="$(lobby_json_home)" || f=""
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        text="$(tr '\r\n' '  ' < "$f")"
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            [ -n "${line#*=}" ] || continue
+            CFGV[${line%%=*}]="${line#*=}"
+        done < <(printf '%s' "$text" |
+            grep -oE '"zp_[a-z0-9_]+"[[:space:]]*:[[:space:]]*"[^"]*"' |
+            sed -E 's/^"(zp_[a-z0-9_]+)"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1=\2/')
+    fi
+}
+
 # T7x runs a compiled script, so nothing can be written into it. What it
 # does have is an exec that reads from disk: its patched Cmd_Exec prefers a
 # file under its gamesettings folder, matched on the last two path
@@ -2811,6 +3310,7 @@ apply_values() {  # apply_values <game> [1 to be quiet] -> APPLIED_N
     local quiet="${2:-0}" n
     if [ "$1" = "t8" ]; then
         write_json_values
+        [ "$JSON_N" -ge 0 ] && write_lobby_json
         APPLIED_N="$JSON_N"
         [ "$APPLIED_N" -lt 0 ] && APPLIED_N=0
         if [ "$quiet" -eq 0 ]; then
@@ -2827,13 +3327,23 @@ apply_values() {  # apply_values <game> [1 to be quiet] -> APPLIED_N
 
     apply_to_scripts "$1"
     n="$APPLIED_N"
+
+    # The file the script reads for itself, which outranks those defaults.
+    PLUTO_CFG=""
+    [ "${GAME_FAM[$1]}" = "pluto" ] && write_pluto_cfg "$1"
+
     if [ "$quiet" -eq 0 ]; then
         if [ "$n" -gt 0 ]; then
             say "Written into $n installed script(s) -- it takes effect on the next pause."
         else
             say "Nothing installed to write it into yet; it will be applied when you install."
         fi
+        if [ -n "$PLUTO_CFG" ]; then
+            say "Written to $PLUTO_CFG"
+            say "The in-game settings menu reads and writes that same file."
+        fi
     fi
+    if [ -n "$PLUTO_CFG" ]; then n=$((n + 1)); APPLIED_N="$n"; fi
     if [ "${#APPLY_SKIPPED[@]}" -gt 0 ]; then
         T7X_CFG=""
         [ "$1" = "t7" ] && write_t7x_cfg
@@ -2889,6 +3399,12 @@ reapply_config() {
     local g
     for g in "${G_KEY[@]}"; do
         [ -f "$(config_file "$g")" ] || continue
+        # A game with a settings file of its own has already kept them --
+        # the install does not touch that file -- and putting the saved
+        # profile back over it would undo anything changed in the pause
+        # menu since.
+        live_values "$g"
+        [ "${#CFGV[@]}" -gt 0 ] && continue
         read_descriptions
         load_config "$g"
         [ "${#CFGV[@]}" -gt 0 ] || continue
@@ -3104,7 +3620,17 @@ do_config() {
     fi
     sp="$(script_for "$game")" || sp=""
     read_choices "$sp"
-    load_config "$game"
+
+    # What the game is using beats what was saved here: the pause menu
+    # writes that file too, so this is where a change made in game arrives.
+    live_values "$game"
+    if [ "${#CFGV[@]}" -gt 0 ]; then
+        say "Showing the settings this game is using, from its own settings file."
+        say "Anything you changed in game is already here. Save to keep it as a profile."
+        blank
+    else
+        load_config "$game"
+    fi
     CFG_DIRTY=0
 
     while true; do
