@@ -29,6 +29,7 @@
 #      ./install.sh --game t8           skip the "which one?" question
 #      ./install.sh --to ~/Plutonium    use this folder, even over a remembered one
 #      ./install.sh --zbundle           with --install --yes: add ZBundle on Black Ops II
+#      ./install.sh --no-zbundle        with --install --yes: leave ZBundle alone
 # ---------------------------------------------------------------------
 set -u
 
@@ -44,6 +45,7 @@ DO_LIST=0
 DO_CONFIGURE=0
 ASSUME_YES=0
 WANT_ZBUNDLE=0
+NO_ZBUNDLE=0
 WANT_GAME=""
 WANT_TO=""
 while [ "$#" -gt 0 ]; do
@@ -56,9 +58,12 @@ while [ "$#" -gt 0 ]; do
         --yes|-y)    ASSUME_YES=1 ;;
         --no-colour|--no-color|--plain) PLAIN=1 ;;
         --zbundle)   WANT_ZBUNDLE=1 ;;
-        --game)      WANT_GAME="${2:-}"; shift ;;
+        --no-zbundle) NO_ZBUNDLE=1 ;;
+        # Lowercased, as install.ps1 does it: --game T6 is the same ask as
+        # --game t6, and refusing it was a difference for its own sake.
+        --game)      WANT_GAME="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift ;;
         --to)        WANT_TO="${2:-}"; shift ;;
-        *) printf '\n  Not an option: %s\n  Try --find, --install, --uninstall, --list, --configure, --yes, --zbundle, --game, --to\n\n' "$1"; exit 1 ;;
+        *) printf '\n  Not an option: %s\n  Try --find, --install, --uninstall, --list, --configure, --yes, --zbundle, --no-zbundle, --game, --to\n\n' "$1"; exit 1 ;;
     esac
     shift
 done
@@ -504,12 +509,39 @@ root_needs() {  # root_needs <family>
     esac
 }
 
-# Pointing at the folder that holds the install is the common slip.
+# Where a family's own folder sits under a folder somebody pointed at. The
+# same list install.ps1 keeps as each family's Subs.
+root_subs() {  # root_subs <family> -> one candidate per line
+    case "$1" in
+        pluto) printf '%s\n' "Plutonium" "Games/Plutonium" \
+                             "Program Files/Plutonium" "Steam/Plutonium" ;;
+        bo3)   printf '%s\n' "Call of Duty Black Ops III" \
+                             "Games/Call of Duty Black Ops III" \
+                             "COD/Call of Duty Black Ops III" \
+                             "Call of Duty/Black Ops III" \
+                             "steamapps/common/Call of Duty Black Ops III" \
+                             "SteamLibrary/steamapps/common/Call of Duty Black Ops III" ;;
+        bo4)   printf '%s\n' "Call of Duty Black Ops 4" "BlackOps4" \
+                             "Games/Call of Duty Black Ops 4" \
+                             "COD/Call of Duty Black Ops 4" \
+                             "Call of Duty/Black Ops 4" \
+                             "steamapps/common/Call of Duty Black Ops IIII" \
+                             "steamapps/common/Call of Duty Black Ops 4" ;;
+    esac
+}
+
+# Pointing at the folder that holds the install is the common slip -- on
+# every family, not only Plutonium, which is all this used to forgive: a
+# --to naming the folder Black Ops III sits in was refused outright while
+# the same path was accepted by install.ps1.
 settle_root() {  # settle_root <family> <typed> -> prints the root, or nothing
-    local t="$2"
+    local t="$2" sub
     t="${t%\"}"; t="${t#\"}"; t="${t/#\~/$HOME}"
     is_root "$1" "$t" && { printf '%s' "$t"; return 0; }
-    [ "$1" = "pluto" ] && is_root pluto "$t/Plutonium" && { printf '%s' "$t/Plutonium"; return 0; }
+    while IFS= read -r sub; do
+        [ -n "$sub" ] || continue
+        is_root "$1" "$t/$sub" && { printf '%s' "$t/$sub"; return 0; }
+    done <<< "$(root_subs "$1")"
     return 1
 }
 
@@ -569,7 +601,17 @@ choose_root() {  # choose_root <family> [force] -> CHOSEN
 # the others are found the first time a game in that family is wanted,
 # and remembered from then on.
 declare -A ROOTS=()
-root_of() { printf '%s' "${ROOTS[$1]:-}"; }
+
+# Falls back to working it out, because almost every caller of root_quiet
+# runs it as $(root_quiet ...) and a subshell takes what it remembered with
+# it -- so ROOTS is empty on any run that never asked a question, and this
+# used to hand back nothing. The doctor's "can I write here" check and the
+# short paths in the installed table both go through it.
+root_of() {
+    local r="${ROOTS[$1]:-}"
+    [ -n "$r" ] && { printf '%s' "$r"; return 0; }
+    root_quiet "$1"
+}
 
 # The folder --to names, when it is one of this family's. It comes ahead of a
 # remembered folder, not only ahead of a question: root_ask goes through
@@ -739,10 +781,11 @@ fi
 # at a time. Only the Treyarch bundle carries it, and it is offered rather
 # than written with everything else (see pick_zbundle). ZShare's script rides
 # as an asset: copied and removed with the ZPause script beside it.
-SLOT_KEY=( t6 t6 t6 t6 t6 t6 t6 t5 t4 t7 t7 t7 t7 t7 t8 )
-SLOT_FAM=( pluto pluto pluto pluto pluto pluto pluto pluto pluto bo3 bo3 bo3 bo3 bo3 bo4 )
-SLOT_KIND=( file file file asset file asset asset file file file file compiled folder folder folder )
+SLOT_KEY=( t6 t6 t6 t6 t6 t6 t6 t6 t5 t4 t7 t7 t7 t7 t7 t8 )
+SLOT_FAM=( pluto pluto pluto pluto pluto pluto pluto pluto pluto pluto bo3 bo3 bo3 bo3 bo3 bo4 )
+SLOT_KIND=( file file file asset asset file asset asset file file file file compiled folder folder folder )
 SLOT_GAME=("T6  Black Ops II" "T6  Black Ops II" "T6  mod version" "T6  mod lobby menu" \
+           "T6  menu background" \
            "T6  ZBundle mod" "T6  ZBundle ZShare" "T6  ZBundle lobby menu" \
            "T5  Black Ops" "T4  World at War" \
            "T7  BOIII / Ezz BOIII" "T7  BOIII (Proton AppData)" "T7  T7x" \
@@ -752,9 +795,12 @@ SLOT_PATH=("storage/t6/raw/scripts/zm/zpause.gsc" \
            "storage/t6/scripts/zm/zpause.gsc" \
            "storage/t6/mods/zm_pause/scripts/zm/zpause.gsc" \
            "storage/t6/mods/zm_pause/zpause.iwd" \
+           "storage/t6/images/menu_zm_cac_backing.iwi" \
            "storage/t6/mods/zm_zbundle/scripts/zm/zpause.gsc" \
            "storage/t6/mods/zm_zbundle/scripts/zm/zshare.gsc" \
-           "storage/t6/mods/zm_zbundle/zpause.iwd" \
+           "storage/t6/mods/zm_zbundle/scripts/zm/zstats.gsc" \
+           "storage/t6/mods/zm_zbundle/scripts/zm/ztweaks.gsc" \
+           "storage/t6/mods/zm_zbundle/zbundle.iwd" \
            "storage/t5/raw/scripts/sp/zpause.gsc" \
            "storage/t4/raw/scripts/sp/zpause.gsc" \
            "boiii/custom_scripts/zpause.gsc" \
@@ -765,16 +811,21 @@ SLOT_PATH=("storage/t6/raw/scripts/zm/zpause.gsc" \
            "project-bo4/mods/zpause")
 # A base of "-" means the family root, "appdata" the BOIII prefix, and
 # anything else is a folder of its own -- see bo3_expand().
-SLOT_BASE=( - - - - - - - - - - appdata - - - - )
+SLOT_BASE=( - - - - - - - - - - - appdata - - - - )
 # What a folder slot is made of: "-" is the Black Ops 4 mod shape, "lua" the
 # lobby menu's folder of Lua. See slot_files_ok(). The menu is game folder
 # only: a client's own data folder is pruned on launch.
-SLOT_FILES=( - - - - - - - - - - - - lua lua - )
+SLOT_FILES=( - - - - - - - - - - - - - lua lua - )
+# The one slot whose payload is named rather than found by shape: the
+# settings menu's background, which is not a script and not a mod folder, and
+# which a download and a source folder both carry at this path. "-" for every
+# slot that is found the usual way.
+SLOT_ASSET=( - - - - "Plutonium/storage/t6/images/menu_zm_cac_backing.iwi" - - - - - - - - - - - )
 # Which slots are extras, offered on their own rather than installed with the
 # rest: "-" for none.
-SLOT_EXTRA=( - - - - zbundle zbundle zbundle - - - - - - - - )
-SLOT_MARK=( - - - - - - - - - "boiii.exe boiii" "" "t7x.exe t7x" "boiii.exe boiii" "t7x.exe t7x" - )
-SLOT_NOTE=("" "" "" "" "" "" "" "" "" "loose script, no mod slot" \
+SLOT_EXTRA=( - - - - - zbundle zbundle zbundle - - - - - - - - )
+SLOT_MARK=( - - - - - - - - - - "boiii.exe boiii" "" "t7x.exe t7x" "boiii.exe boiii" "t7x.exe t7x" - )
+SLOT_NOTE=("" "" "" "" "" "" "" "" "" "" "loose script, no mod slot" \
            "original BOIII's other script folder -- Ezz BOIII clears it on launch" "compiled build, no mod slot" \
            "the lobby settings menu" "the lobby settings menu" "")
 
@@ -894,6 +945,13 @@ slot_version() {  # slot_version <i> <full path> -> version, or nothing if absen
         [ -f "$2" ] || return 1
         v="$(read_version "$(dirname "$2")/scripts/zm/zpause.gsc")" || v=""
         [ -n "$v" ] || { v="$(read_version "$(dirname "$2")/zpause.gsc")" || v=""; }
+        # Nothing beside it: the menu background lives in the game's own
+        # images folder rather than in a mod, and it installs with the
+        # script for that game, so that script is what dates it.
+        for ref in raw/scripts/zm/zpause.gsc scripts/zm/zpause.gsc raw/scripts/sp/zpause.gsc; do
+            [ -n "$v" ] && break
+            v="$(read_version "$(dirname "$(dirname "$2")")/$ref")" || v=""
+        done
         [ -n "$v" ] || v="?"
         printf '%s' "$v"
         return 0
@@ -1085,7 +1143,7 @@ norm_name() {
 }
 
 get_latest() {  # get_latest <repo> <asset prefix>
-    LATEST_VERSION=""; LATEST_URL=""; LATEST_NAME=""; LATEST_SIZE=0
+    LATEST_VERSION=""; LATEST_URL=""; LATEST_NAME=""; LATEST_SIZE=0; LATEST_SUMS=""
     net_ready || return 1
     local api json urls u base
     api="https://api.github.com/repos/$1/releases/latest"
@@ -1094,8 +1152,14 @@ get_latest() {  # get_latest <repo> <asset prefix>
     else say "Needs curl or wget, and neither is installed."; return 1; fi
     [ -n "$json" ] || { net_problem; return 1; }
 
+    # The tag, cut out on its own before the version is read out of it. Doing
+    # both in one expression let the greedy [^"]* eat the "v1." and leave the
+    # tail: v1.5 came back as 5, v1.10 as 0 and v1.5.2.d as nothing, so every
+    # comparison said "you already have the latest" and a forced download was
+    # refused as labelled v5 by a script that says v1.5.
     LATEST_VERSION="$(printf '%s' "$json" |
-        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"[^"]*[vV]\?\([0-9][0-9.]*\)".*/\1/p' | head -n 1)"
+        grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 |
+        sed -n 's/.*:[[:space:]]*"[^0-9"]*\([0-9][0-9.]*d\?\)".*/\1/p')"
 
     urls="$(printf '%s' "$json" |
         grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' |
@@ -1119,9 +1183,13 @@ get_latest() {  # get_latest <repo> <asset prefix>
         esac
     done <<< "$urls"
     if [ -z "$LATEST_URL" ]; then
+        # Nothing matched the prefix, so the first zip on the release it is
+        # -- and it is said out loud, because on the ZPause release that is
+        # the Black Ops II download rather than whatever was asked for.
         while IFS= read -r u; do
             case "$u" in *.zip) LATEST_URL="$u"
                 LATEST_NAME="$(basename "$u" | sed 's/%20/ /g; s/%5B/[/g; s/%5D/]/g')"
+                say "No $2 download on that release; taking $LATEST_NAME"
                 break ;;
             esac
         done <<< "$urls"
@@ -1274,6 +1342,11 @@ do_pick_release() {
     i=$((c - 1))
     LATEST_URL="${GHU[$i]}"; LATEST_NAME="${GHN[$i]}"
     LATEST_VERSION="${GHV[$i]}"; LATEST_SIZE=0
+    # Not this release's manifest: the list does not carry one. Leaving
+    # whatever get_latest last saw would check this download against a
+    # different release's checksums, find no line for it, and skip the
+    # check without saying so.
+    LATEST_SUMS=""
 
     fetch_payload || return 0
     adopt_payload "$FETCHED"
@@ -1495,6 +1568,29 @@ PLAN_FROM=(); PLAN_TO=()
 # Which slots for a game are ticked for install. Every slot is, except
 # that Black Ops III's routes are tick boxes (see pick_routes).
 PICKED=()
+# A mod folder reads one .iwd per path, so the bundle has one menu.
+#
+# Black Ops II draws its lobby and its in-game menu in Lua, and a mod reaches
+# either by shipping the game's own copy of a stock file with a require of its
+# own on the end. Every mod in the bundle does that to the same two files, so
+# the bundle ships them merged -- one zbundle.iwd with every mod's require in
+# it. Before 1.6 it shipped each mod's .iwd instead, and the game read
+# whichever it found first: a bundle whose lobby page was headed ZPAUSE
+# SETTINGS and carried nobody else's.
+#
+# An install therefore takes out the zpause.iwd one of those left behind. It
+# is our file, it would race the merged one, and the backup keeps it the way
+# every removal here does.
+OLD_MENU=""
+old_menu() {  # old_menu <i> <to> -> 0 when a pre-1.6 menu is beside the merged one
+    case "${SLOT_PATH[$1]}" in
+        *mods/zm_zbundle/zbundle.iwd) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$(dirname "$2")/zpause.iwd" ] || return 1
+    return 0
+}
+
 install_plan() {  # install_plan <key> -> PLAN_FROM / PLAN_TO / PLAN_KIND
     PLAN_FROM=(); PLAN_TO=(); PLAN_KIND=()
     local key="$1" i to src f from
@@ -1516,6 +1612,17 @@ install_plan() {  # install_plan <key> -> PLAN_FROM / PLAN_TO / PLAN_KIND
         fi
         if [ "${SLOT_EXTRA[$i]:--}" != "-" ]; then
             from="$(extra_payload "$i")" || continue
+            if old_menu "$i" "$to"; then
+                OLD_MENU="$(dirname "$to")/zpause.iwd"
+            fi
+            PLAN_FROM+=("$from"); PLAN_TO+=("$to"); PLAN_KIND+=("${SLOT_KIND[$i]}")
+            continue
+        fi
+        if [ "${SLOT_ASSET[$i]:--}" != "-" ]; then
+            # Named rather than found: it is not shaped like a script or a
+            # mod folder, and a source folder carries it at the same path.
+            from="${ROOT:-}/${SLOT_ASSET[$i]}"
+            [ -f "$from" ] || continue
             PLAN_FROM+=("$from"); PLAN_TO+=("$to"); PLAN_KIND+=("${SLOT_KIND[$i]}")
             continue
         fi
@@ -1583,7 +1690,11 @@ extra_payload() {  # extra_payload <i>
 # ZBundle is asked about, not assumed: it is a second Black Ops II mod, and
 # most players want one or the other. Already installed, the answer defaults
 # to yes, so an update keeps it in step with the ZPause beside it; --yes
-# takes that default, and --zbundle says yes outright.
+# takes that default, --zbundle says yes outright and --no-zbundle no. Both
+# is a no: a refusal is the one of the two worth honouring, and the folder can
+# hold another bundle's files -- an installed ZBundle is reason enough to keep
+# it in step, but not reason to write over one on a machine whose owner has
+# just said not to.
 pick_zbundle() {  # pick_zbundle <key> -- sets PICKED for the ZBundle slots
     local key="$1" i extras=() have=0 want=0 zs="" full p d
     for i in "${!SLOT_PATH[@]}"; do
@@ -1600,7 +1711,8 @@ pick_zbundle() {  # pick_zbundle <key> -- sets PICKED for the ZBundle slots
     done
     [ "${#extras[@]}" -gt 0 ] || return 0
     { [ "$WANT_ZBUNDLE" -eq 1 ] || [ "$have" -eq 1 ]; } && want=1
-    if [ "$ASSUME_YES" -eq 0 ]; then
+    [ "$NO_ZBUNDLE" -eq 1 ] && want=0
+    if [ "$ASSUME_YES" -eq 0 ] && [ "$NO_ZBUNDLE" -eq 0 ]; then
         [ -n "$zs" ] && zs=" v$zs"
         blank
         say "This download also carries ZBundle: ZPause and ZShare$zs as one mod,"
@@ -1788,6 +1900,18 @@ do_install() {  # do_install [1 to skip the confirmation] [key]
     else
         say "Installed $n file(s)."
     fi
+    if [ -n "$OLD_MENU" ] && [ -f "$OLD_MENU" ]; then
+        backup_file "$OLD_MENU"
+        if rm -f "$OLD_MENU"; then
+            log "removed" "$OLD_MENU"
+            say ""
+            say "Took out the zpause.iwd a ZBundle before 1.6 left in mods/zm_zbundle:"
+            say "  $OLD_MENU"
+            say "the bundle has one merged menu now, and both files carry the same stock"
+            say "Lua -- so the game would read whichever of them it found first."
+        fi
+    fi
+    OLD_MENU=""
     for i in "${!PLAN_TO[@]}"; do
         case "${PLAN_TO[$i]}" in
             */mods/zm_zbundle/*)
@@ -2218,22 +2342,26 @@ ref_for() {  # ref_for <version> <key> [kind] [installed path] -- a known-good c
     # a version, and the first script found was the wrong game's. And by
     # copy: an installed path in T6's mod folder is held up against the mod
     # variant, not the loose script it differs from by a line.
-    local v="${1:-}" key="${2:-}" kind="${3:-file}" path="${4:-}" i one ck mod="" zshare=""
+    local v="${1:-}" key="${2:-}" kind="${3:-file}" path="${4:-}" i one ck mod="" guest=""
     [ -n "$v" ] && [ "$v" != "?" ] || return 0
     # ZBundle's ZPause script is the same mod variant as zm_pause's, and its
-    # lobby menu the same .iwd. Its ZShare script is nobody else's, so that
-    # one is held up against ZBundle's own copy in the download.
+    # lobby menu the same .iwd. Every other mod's script in there is nobody
+    # else's file, so each is held up against ZBundle's own copy in the
+    # download rather than against a payload no other slot has.
     case "$kind:$path" in file:*/mods/zm_pause/*|file:*/mods/zm_zbundle/*) mod="mod" ;; esac
-    case "$path" in */mods/zm_zbundle/*/zshare.gsc) zshare="zshare" ;; esac
-    ck="$v|$key|$kind|$mod|$zshare"
+    case "$path" in
+        */mods/zm_zbundle/scripts/zm/zpause.gsc) ;;
+        */mods/zm_zbundle/scripts/zm/*.gsc) guest="${path##*/}"; guest="${guest%.gsc}" ;;
+    esac
+    ck="$v|$key|$kind|$mod|$guest"
     if [ "$ck" = "$REF_VER" ]; then printf '%s' "$REF_PATH"; return 0; fi
     REF_VER="$ck"; REF_PATH=""
     get_choices
     if [ "${#CH_DIR[@]}" -gt 0 ]; then
         for i in "${!CH_DIR[@]}"; do
             [ "${CH_VER[$i]}" = "$v" ] || continue
-            if [ -n "$zshare" ]; then
-                one="${CH_DIR[$i]}/Plutonium/storage/$key/mods/zm_zbundle/scripts/zm/zshare.gsc"
+            if [ -n "$guest" ]; then
+                one="${CH_DIR[$i]}/Plutonium/storage/$key/mods/zm_zbundle/scripts/zm/$guest.gsc"
                 [ -f "$one" ] && { REF_PATH="$one"; break; }
                 continue
             fi
@@ -2259,7 +2387,13 @@ verify_sums() {  # verify_sums <root> -- 0 = fine, 1 = something does not match
     SUMS_OK=0
     local f="$1/SHA256SUMS" line want rel p got bad=0
     [ -f "$f" ] || return 0
-    have sha256sum || have shasum || return 0
+    # No hashing tool, so the manifest cannot be checked. Say so rather than
+    # returning quietly: install.ps1 always hashes, and a download going in
+    # unverified is worth a line either way.
+    if ! have sha256sum && ! have shasum; then
+        say "No sha256sum or shasum here, so the download was not checked against SHA256SUMS."
+        return 0
+    fi
     while IFS= read -r line; do
         case "$line" in [0-9a-f][0-9a-f]*) ;; *) continue ;; esac
         want="${line%% *}"
@@ -2301,7 +2435,11 @@ verify_payload() {  # verify_payload <root> <version it claims>
     # The manifest checks every file, which is strictly better than checking
     # the one script; the version check below stays for downloads too old to
     # carry one, and for a source folder, which has no manifest describing it.
-    if is_download "$1" && ! verify_sums "$1"; then
+    # Zeroed here as well, because the short-circuit above skips verify_sums
+    # entirely for a source folder and the count would be the last run's.
+    if ! is_download "$1"; then
+        SUMS_OK=0
+    elif ! verify_sums "$1"; then
         say "Not installing it -- delete it from the cache and try again."
         return 1
     fi
@@ -2797,18 +2935,23 @@ script_for() {  # script_for <game>
 # Black Ops 4 ships compiled, so the build writes zpause.settings beside it
 # instead: name|type|default|section|description, one per line, generated
 # from the same script. Both end up as the DV_* rows the editor edits.
+#
+# The game's own file first. The bundle carries all five, and the bare
+# zpause.settings there is Black Ops 4's -- looking for that one first
+# offered Shield's combo list while configuring Black Ops, where none of
+# those names is a combo the script accepts.
 manifest_for() {  # manifest_for <key>
     local r d
     for r in "${ROOT:-}" "${HOME_ROOT:-}"; do
         [ -n "$r" ] || continue
-        [ -f "$r/zpause.settings" ] && { printf '%s' "$r/zpause.settings"; return 0; }
         [ -f "$r/zpause-$1.settings" ] && { printf '%s' "$r/zpause-$1.settings"; return 0; }
+        [ -f "$r/zpause.settings" ] && { printf '%s' "$r/zpause.settings"; return 0; }
     done
     get_choices
     if [ "${#CH_DIR[@]}" -gt 0 ]; then
         for d in "${CH_DIR[@]}"; do
-            [ -f "$d/zpause.settings" ] && { printf '%s' "$d/zpause.settings"; return 0; }
             [ -f "$d/zpause-$1.settings" ] && { printf '%s' "$d/zpause-$1.settings"; return 0; }
+            [ -f "$d/zpause.settings" ] && { printf '%s' "$d/zpause.settings"; return 0; }
         done
     fi
     return 1
@@ -3718,7 +3861,11 @@ do_config() {
                             *"$q"*) idx+=("$i") ;;
                         esac
                     done
-                    edit_list "Matching '$q'" "${idx[@]-}"
+                    # "${idx[@]-}" on an empty array is one empty argument,
+                    # not none, so the "nothing matches" guard inside
+                    # edit_list never fired and a search that found nothing
+                    # offered the first setting instead.
+                    edit_list "Matching '$q'" ${idx[@]+"${idx[@]}"}
                 fi ;;
             w) save_config "$game"; CFG_DIRTY=0 ;;
             e)

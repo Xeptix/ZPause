@@ -1,4 +1,4 @@
-<#
+﻿<#
     ZPause Manager -- every game ZPause runs on.
 
     Black Ops II, Black Ops and World at War on Plutonium; Black Ops III on
@@ -25,6 +25,7 @@
         install.bat -Game t8              skip the "which one?" question
         install.bat -To "D:\Plutonium"    use this folder, even over a remembered one
         install.bat -ZBundle              with -Install -Yes: add ZBundle on Black Ops II
+        install.bat -NoZBundle            with -Install -Yes: leave ZBundle alone
 #>
 param(
     [switch]$Find,
@@ -36,6 +37,7 @@ param(
     [switch]$NoColour,
     [switch]$NoColor,
     [switch]$ZBundle,
+    [switch]$NoZBundle,
     [string]$Game,
     [string]$To
 )
@@ -134,7 +136,10 @@ $SettingsFile = Path-Join $StateDir 'settings.txt'
 function Load-Settings {
     $s = @{}
     if (Test-Here $SettingsFile) {
-        foreach ($line in (Get-Content -LiteralPath $SettingsFile)) {
+        # -Encoding UTF8 to match Save-Settings: Windows PowerShell's
+        # Get-Content defaults to the system codepage, which would read a
+        # path with an accent in it back as something else again.
+        foreach ($line in (Get-Content -LiteralPath $SettingsFile -Encoding UTF8)) {
             if ($line -match '^\s*([a-z_]+)\s*=\s*(.+?)\s*$') { $s[$Matches[1]] = $Matches[2] }
         }
     }
@@ -143,8 +148,12 @@ function Load-Settings {
 function Save-Settings($s) {
     try {
         if (-not (Test-Here $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+        # UTF8, because a game folder is a path: ASCII turned every accented
+        # or non-Latin character into a question mark, so the folder it
+        # remembered was one that does not exist and the question came back
+        # every run. Get-Content reads it back as UTF8 without being told.
         ($s.Keys | Sort-Object | ForEach-Object { "$_=" + $s[$_] }) |
-            Set-Content -LiteralPath $SettingsFile -Encoding ASCII
+            Set-Content -LiteralPath $SettingsFile -Encoding UTF8
     } catch {}
 }
 $Settings = Load-Settings
@@ -668,18 +677,31 @@ $SLOTS = @(
        Path = 'storage\t6\mods\zm_pause\scripts\zm\zpause.gsc' }
     @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Game = 'T6  mod lobby menu'
        Path = 'storage\t6\mods\zm_pause\zpause.iwd' }
+    # The settings menu's background. It replaces one of the game's own
+    # materials, so it goes where Plutonium reads images from rather than
+    # into the mod: a new material inside the .iwd draws as a checkerboard.
+    # Every Z mod ships these same bytes under this name, so installing it
+    # after another one of them writes the same file again. Whatever was
+    # there first is backed up like any other file this replaces.
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Game = 'T6  menu background'
+       Path = 'storage\t6\images\menu_zm_cac_backing.iwi'
+       Asset = 'Plutonium\storage\t6\images\menu_zm_cac_backing.iwi' }
     # ZBundle: ZPause and ZShare as one Black Ops II mod, for a player who wants
-    # both from the Mods menu, where Plutonium enables one mod at a time. Only
-    # the Treyarch bundle carries it, and it is offered rather than written with
-    # everything else, since it is a mod of its own. ZShare's script rides as
-    # an asset -- copied and removed with the ZPause script beside it, never
-    # read or configured.
+    # all of them from the Mods menu, where Plutonium enables one mod at a
+    # time. Only the Treyarch bundle carries it, and it is offered rather than
+    # written with everything else, since it is a mod of its own. Every other
+    # mod's script rides as an asset -- copied and removed with the ZPause
+    # script beside it, never read or configured.
     @{ Key = 't6'; Family = 'pluto'; Kind = 'file'; Extra = 'zbundle'; Game = 'T6  ZBundle mod'
        Path = 'storage\t6\mods\zm_zbundle\scripts\zm\zpause.gsc' }
     @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle ZShare'
        Path = 'storage\t6\mods\zm_zbundle\scripts\zm\zshare.gsc' }
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle ZStats'
+       Path = 'storage\t6\mods\zm_zbundle\scripts\zm\zstats.gsc' }
+    @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle ZTweaks'
+       Path = 'storage\t6\mods\zm_zbundle\scripts\zm\ztweaks.gsc' }
     @{ Key = 't6'; Family = 'pluto'; Kind = 'asset'; Extra = 'zbundle'; Game = 'T6  ZBundle lobby menu'
-       Path = 'storage\t6\mods\zm_zbundle\zpause.iwd' }
+       Path = 'storage\t6\mods\zm_zbundle\zbundle.iwd' }
     @{ Key = 't5'; Family = 'pluto'; Kind = 'file'; Game = 'T5  Black Ops'
        Path = 'storage\t5\raw\scripts\sp\zpause.gsc' }
     @{ Key = 't4'; Family = 'pluto'; Kind = 'file'; Game = 'T4  World at War'
@@ -925,6 +947,15 @@ function Slot-Version($slot, $full) {
             $v = Read-Version (Path-Join $dir $c)
             if ($v) { return $v }
         }
+        # Nothing beside it: the menu background lives in the game's own
+        # images folder rather than in a mod, and it installs with the
+        # script for that game, so that script is what dates it.
+        $storage = Split-Path -Parent $dir
+        foreach ($c in @('raw\scripts\zm\zpause.gsc', 'scripts\zm\zpause.gsc',
+                         'raw\scripts\sp\zpause.gsc')) {
+            $v = Read-Version (Path-Join $storage $c)
+            if ($v) { return $v }
+        }
         return '?'
     }
     if ($slot.Kind -eq 'folder') {
@@ -1151,7 +1182,16 @@ function Get-Latest($repo, $assetPrefix) {
         if ($a.name -like '*.zip' -and (Norm-Name $a.name).StartsWith($want)) { $asset = $a; break }
     }
     if (-not $asset) {
-        foreach ($a in $r.assets) { if ($a.name -like '*.zip') { $asset = $a; break } }
+        # Nothing matched the prefix, so the first zip on the release it is
+        # -- and it is said out loud, because on the ZPause release that is
+        # the Black Ops II download rather than whatever was asked for.
+        foreach ($a in $r.assets) {
+            if ($a.name -like '*.zip') {
+                $asset = $a
+                Say ("No " + $assetPrefix + " download on that release; taking " + $a.name) Yellow
+                break
+            }
+        }
     }
     if (-not $asset) {
         Say 'That release has no zip attached to it.' Red
@@ -1427,17 +1467,20 @@ function Ref-For($version, $key, $kind, $path) {
     if (-not $version -or $version -eq '?') { return $null }
     if (-not $kind) { $kind = 'file' }
     # ZBundle's ZPause script is the same mod variant as zm_pause's, and its
-    # lobby menu the same .iwd. Its ZShare script is nobody else's, so that
-    # one is held up against ZBundle's own copy in the download.
+    # lobby menu the same .iwd. Every other mod's script in there is nobody
+    # else's file, so each is held up against ZBundle's own copy in the
+    # download rather than against a payload no other slot has.
     $mod = ($kind -eq 'file' -and $path -and $path -match '\\mods\\zm_(pause|zbundle)\\')
-    $zshare = ($path -and $path -like '*\mods\zm_zbundle\*\zshare.gsc')
-    $ck = $version + '|' + $key + '|' + $kind + '|' + $mod + '|' + $zshare
+    $guest = $null
+    if ($path -and $path -match '\\mods\\zm_zbundle\\scripts\\zm\\([A-Za-z0-9_]+)\.gsc$' -and
+        $Matches[1] -ne 'zpause') { $guest = $Matches[1] }
+    $ck = $version + '|' + $key + '|' + $kind + '|' + $mod + '|' + $guest
     if ($script:RefCache.ContainsKey($ck)) { return $script:RefCache[$ck] }
     $found = $null
     foreach ($c in (Get-Choices)) {
         if ($c.Version -ne $version) { continue }
-        if ($zshare) {
-            $found = Path-Join $c.Folder ('Plutonium\storage\' + $key + '\mods\zm_zbundle\scripts\zm\zshare.gsc')
+        if ($guest) {
+            $found = Path-Join $c.Folder ('Plutonium\storage\' + $key + '\mods\zm_zbundle\scripts\zm\' + $guest + '.gsc')
             if (-not (Test-Here $found)) { $found = $null }
         } else {
             $found = Payload-In $c.Folder $key $kind
@@ -1815,6 +1858,30 @@ function Get-Payload {
     return $out
 }
 
+<#
+    A mod folder reads one .iwd per path, so the bundle has one menu.
+
+    Black Ops II draws its lobby and its in-game menu in Lua, and a mod
+    reaches either by shipping the game's own copy of a stock file with a
+    require of its own on the end. Every mod in the bundle does that to the
+    same two files, so the bundle ships them merged -- one zbundle.iwd with
+    every mod's require in it. Before 1.6 it shipped each mod's .iwd
+    instead, and the game read whichever it found first: a bundle whose
+    lobby page was headed ZPAUSE SETTINGS and carried nobody else's.
+
+    An install therefore takes out the zpause.iwd one of those left behind.
+    It is our file, it would race the merged one, and the backup keeps it
+    the way every removal here does.
+#>
+function Old-Menu($slot) {
+    if (-not $slot.Path -or $slot.Path -notlike '*mods\zm_zbundle\zbundle.iwd') { return $null }
+    $to = Slot-Path $slot
+    if (-not $to) { return $null }
+    $old = Path-Join (Split-Path -Parent $to) 'zpause.iwd'
+    if (Test-Here $old) { return $old }
+    return $null
+}
+
 function Install-Plan($key) {
     # Where each file goes for this game: (From, To, Kind, Slot). A folder
     # slot expands to every file the mod is made of, so the copy loop can
@@ -1840,6 +1907,16 @@ function Install-Plan($key) {
         if ($slot.Extra) {
             $from = Extra-Payload $slot
             if (-not $from) { continue }
+            $stale = Old-Menu $slot
+            if ($stale) { $script:OldMenu = $stale }
+            $plan += [pscustomobject]@{ From = $from; To = $to; Kind = $slot.Kind; Slot = $slot }
+            continue
+        }
+        if ($slot.Asset) {
+            # Named rather than found: it is not shaped like a script or a
+            # mod folder, and a source folder carries it at the same path.
+            $from = Path-Join $script:Root $slot.Asset
+            if (-not (Test-Here $from)) { continue }
             $plan += [pscustomobject]@{ From = $from; To = $to; Kind = $slot.Kind; Slot = $slot }
             continue
         }
@@ -1910,14 +1987,18 @@ function Extra-Payload($slot) {
     ZBundle is asked about, not assumed: it is a second Black Ops II mod, and
     most players want one or the other. Already installed, the answer
     defaults to yes, so an update keeps it in step with the ZPause beside it;
-    -Yes takes that default, and -ZBundle says yes outright.
+    -Yes takes that default, -ZBundle says yes outright and -NoZBundle no.
+    Both is a no: a refusal is the one of the two worth honouring, and the
+    folder can hold another bundle's files -- an installed ZBundle is reason
+    enough to keep it in step, but not reason to write over one on a machine
+    whose owner has just said not to.
 #>
 function Pick-ZBundle($mine) {
     $extras = @($mine | Where-Object { $_.Extra -eq 'zbundle' -and (Extra-Payload $_) })
     if ($extras.Count -eq 0) { return }
     $have = @($extras | Where-Object { $p = Slot-Path $_; $p -and (Test-Here $p) }).Count -gt 0
-    $want = [bool]$ZBundle -or $have
-    if (-not $script:AssumeYes) {
+    $want = (-not $NoZBundle) -and ([bool]$ZBundle -or $have)
+    if (-not $script:AssumeYes -and -not $NoZBundle) {
         $zs = ''
         $zsSlot = @($extras | Where-Object { $_.Path -like '*zshare.gsc' } | Select-Object -First 1)
         if ($zsSlot.Count -gt 0) {
@@ -2098,6 +2179,19 @@ function Do-Install($noConfirm, $key) {
     Blank
     $script:CountInstalled += $n
     if ($v) { Say "Installed $n file(s) -- v$v." Green } else { Say "Installed $n file(s)." Green }
+    if ($script:OldMenu) {
+        if (Test-Here $script:OldMenu) {
+            Backup-File $script:OldMenu
+            Remove-Item -LiteralPath $script:OldMenu -Force
+            Log 'removed' $script:OldMenu
+            Say ''
+            Say 'Took out the zpause.iwd a ZBundle before 1.6 left in mods\zm_zbundle:' Yellow
+            Say ('  ' + $script:OldMenu) DarkGray
+            Say 'the bundle has one merged menu now, and both files carry the same stock' DarkGray
+            Say 'Lua -- so the game would read whichever of them it found first.' DarkGray
+        }
+        $script:OldMenu = $null
+    }
     if (@($plan | Where-Object { $_.Slot.Extra -eq 'zbundle' -and $_.Kind -ne 'stamp' }).Count -gt 0) {
         Say 'ZBundle is in mods\zm_zbundle -- pick zm_zbundle in the Mods menu to run it.' DarkGray
     }
@@ -2725,15 +2819,20 @@ function Script-For($game) {
     edits.
 #>
 function Manifest-For($key) {
+    # The game's own file first. The bundle carries all five, and the bare
+    # zpause.settings there is Black Ops 4's -- looking for that one first
+    # offered Shield's combo list while configuring Black Ops, where none
+    # of those names is a combo the script accepts.
     $name = 'zpause.settings'
+    $own = 'zpause-' + $key + '.settings'
     foreach ($root in @($script:Root, $HomeRoot)) {
         if (-not $root) { continue }
-        foreach ($try in @((Path-Join $root $name), (Path-Join $root ('zpause-' + $key + '.settings')))) {
+        foreach ($try in @((Path-Join $root $own), (Path-Join $root $name))) {
             if (Test-Here $try) { return $try }
         }
     }
     foreach ($c in (Get-Choices)) {
-        foreach ($try in @((Path-Join $c.Folder $name), (Path-Join $c.Folder ('zpause-' + $key + '.settings')))) {
+        foreach ($try in @((Path-Join $c.Folder $own), (Path-Join $c.Folder $name))) {
             if (Test-Here $try) { return $try }
         }
     }
