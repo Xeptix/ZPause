@@ -34,7 +34,7 @@ zp_vote_no_combo|str|jump_melee|voting|Combo for a no vote: jump_melee, crouch_u
 zp_round_pause|int|0|timing|Hold a pause until the round is over instead of freezing the game mid-horde. Asking again calls it off.
 zp_max_pauses|int|0|timing|How many times one match can be paused. 0 is no cap. Only a pause somebody asked for spends one - an automatic pause does not.
 zp_pause_on_disconnect|int|0|timing|Pause when somebody drops, so whoever is left isn't overrun while they rejoin. Nothing un-pauses on its own, so zp_max_pause_time is the way out if they don't come back.
-zp_countdown|int|3|timing|Seconds of 3‑2‑1 before play resumes.
+zp_countdown|int|3|timing|Seconds of 3-2-1 before play resumes.
 zp_ease|int|1|timing|Ease time down into the pause and back out, instead of cutting to a stop.
 zp_ease_time|float|0.35|timing|Seconds of ramp at each end.
 zp_grace|float|2|timing|Seconds of invulnerability after resuming.

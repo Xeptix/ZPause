@@ -1,0 +1,9 @@
+# This repository's files ARE the download, and it ships a SHA256SUMS over them, so git must not
+# translate a single byte of any of them: a line-ending conversion on checkout would break every
+# checksum and, on install.sh, would make bash read a CR as part of the shebang and report
+# "bad interpreter" - the whole Linux and Steam Deck install, lost silently.
+#
+# core.autocrlf is true in this machine's system git config, so without this line a clone of this
+# repository checks out CRLF while the repository stores LF. Found on 2026-10-08, when the five clones
+# were first made: install.sh came out 166,427 bytes against the 162,378 the repository holds.
+* -text

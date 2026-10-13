@@ -312,10 +312,17 @@ $HOME_REPO = 'Xeptix/ZPause'
 $OTHER_MODS = 'OTHERMODS.MD'
 
 # ------------------------------------------------- version arithmetic
-# A public version is X.Y. A development build appends .N.d and is working
-# towards X.Y, so it sorts below the release of the same number.
+# A public version is X.Y. A build being tested appends -snapshot.N (or
+# -early.N) and is working towards X.Y, so it sorts below the release of the
+# same number. The older .N.d shape means the same thing and is still read:
+# every build made before October 2026 carries it, and so does every copy of
+# one already installed, which this reads off disk to decide what to do.
+$VER_PATTERN = '[0-9]+\.[0-9]+(?:-(?:snapshot|early)\.[0-9]+|\.[0-9]+\.d)?'
 function Ver-Parts($v) {
     if (-not $v) { return $null }
+    if ($v -match '^([0-9]+)\.([0-9]+)-(?:snapshot|early)\.([0-9]+)$') {
+        return @([int]$Matches[1], [int]$Matches[2], 0, [int]$Matches[3])
+    }
     if ($v -match '^([0-9]+)\.([0-9]+)\.([0-9]+)\.d$') {
         return @([int]$Matches[1], [int]$Matches[2], 0, [int]$Matches[3])
     }
@@ -930,7 +937,7 @@ function Read-Version($file) {
     if (-not (Test-Here $file)) { return $null }
     try {
         $head = (Get-Content -LiteralPath $file -TotalCount 40) -join "`n"
-        if ($head -match 'ZPAUSE(?: T\d)? v([0-9][0-9.]*d?)') { return $Matches[1] }
+        if ($head -match ('ZPAUSE(?: T\d)? v(' + $VER_PATTERN + ')')) { return $Matches[1] }
     } catch {}
     return '?'
 }
@@ -1169,7 +1176,7 @@ function Get-Latest($repo, $assetPrefix) {
         return $null
     }
     $ver = $null
-    if ("$($r.tag_name)" -match '([0-9]+\.[0-9]+(?:\.[0-9]+\.d)?)') { $ver = $Matches[1] }
+    if ("$($r.tag_name)" -match ('(' + $VER_PATTERN + ')')) { $ver = $Matches[1] }
 
     # GitHub rewrites the spaces in an uploaded asset's name, so what goes up
     # as "ZPause T6 v1.3 by Xep.zip" comes back as "ZPause.T6.v1.3.by.Xep.zip".
@@ -1197,7 +1204,7 @@ function Get-Latest($repo, $assetPrefix) {
         Say 'That release has no zip attached to it.' Red
         return $null
     }
-    if (-not $ver -and $asset.name -match '[ .]v([0-9]+\.[0-9]+(?:\.[0-9]+\.d)?)[ .]') { $ver = $Matches[1] }
+    if (-not $ver -and $asset.name -match ('[ .]v(' + $VER_PATTERN + ')[ .]')) { $ver = $Matches[1] }
     # A manifest attached to the release itself, if there is one. The
     # manifest inside a zip cannot vouch for the zip.
     $sums = $null
@@ -1297,7 +1304,7 @@ function Release-Of($folder) {
     # v1.3 by Xep" says both things, and GitHub's dots do not get in the way.
     $r = Read-Release $folder
     $leaf = Split-Path -Leaf $folder
-    if (-not $r['version'] -and $leaf -match '[ .]v([0-9]+\.[0-9]+(?:\.[0-9]+\.d)?)([ .]|$)') {
+    if (-not $r['version'] -and $leaf -match ('[ .]v(' + $VER_PATTERN + ')([ .]|$)')) {
         $r['version'] = $Matches[1]
     }
     if (-not $r['name']) {
@@ -1642,8 +1649,8 @@ function Get-Releases($repo, $assetPrefix) {
         }
         if (-not $asset) { continue }
         $ver = $null
-        if ("$($rel.tag_name)" -match '([0-9]+\.[0-9]+(?:\.[0-9]+\.d)?)') { $ver = $Matches[1] }
-        if (-not $ver -and $asset.name -match '[ .]v([0-9]+\.[0-9]+(?:\.[0-9]+\.d)?)[ .]') {
+        if ("$($rel.tag_name)" -match ('(' + $VER_PATTERN + ')')) { $ver = $Matches[1] }
+        if (-not $ver -and $asset.name -match ('[ .]v(' + $VER_PATTERN + ')[ .]')) {
             $ver = $Matches[1]
         }
         $out += [pscustomobject]@{
@@ -2008,8 +2015,8 @@ function Pick-ZBundle($mine) {
             } catch {}
         }
         Blank
-        Say ('This download also carries ZBundle: ZPause and ZShare' + $zs + ' as one mod,') White
-        Say 'for playing both from the Mods menu. It goes in mods\zm_zbundle, beside' DarkGray
+        Say 'This download also carries ZBundle: ZPause, ZShare, ZStats and ZTweaks as one mod,' White
+        Say 'for playing them together from the Mods menu. It goes in mods\zm_zbundle, beside' DarkGray
         Say 'zm_pause, and does nothing until you pick zm_zbundle there.' DarkGray
         $def = 'n'
         if ($want) { $def = 'y' }

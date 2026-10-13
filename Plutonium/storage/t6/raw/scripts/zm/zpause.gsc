@@ -1,6 +1,6 @@
 /*
 ======================================================================
-    ZPAUSE v1.6  --  Synced co-op pause for Black Ops II Zombies
+    ZPAUSE v1.7  --  Synced co-op pause for Black Ops II Zombies
     Plutonium T6
 
     by Xep
@@ -137,6 +137,12 @@ init()
     // Unconditional: precaching has to happen during init, so gating this on
     // the config would mean turning zp_blackout on later silently did nothing.
     precacheshader( "black" );
+
+    // The LUI event zp_ui_tell() sends every player. An event name has to be
+    // precached before it is sent, as stock zombies precaches its own
+    // (&"hud_update_survival_team"); Black Ops III's copy found out the hard
+    // way, where the send threw and took the publisher down with it.
+    precachestring( &"zpause_state" );
 
     // Built once: arrays are parent variables, and the menu is opened
     // many times a match.
@@ -5623,16 +5629,13 @@ zp_api_menu_request( response )
         return;
 
     /*
-        The host's press, and nobody else's -- but only where the engine
-        will say who the host is. Where it will not, the row was drawn on
-        this screen and this is the screen that pressed it; everything
-        that decides a pause still has its say downstream.
+        Anybody's press, since 1.7 (Xep, 11 October 2026): the pause menu's
+        row is everybody's, on the combo's rules, and it goes in at the same
+        door the combo does. zp_host_only, the vote, the host's approval and
+        a personal pause all still decide inside the request - a press
+        zp_host_only would turn away is turned away there, with the same line
+        a combo gets.
     */
-    if ( isdefined( zp_host_player() ) && !zp_player_is_host( self ) )
-    {
-        self iprintln( "^1[Pause]^7 only the host can pause" );
-        return;
-    }
 
     /*
         A resume asked for from inside the pause menu is not the pause
@@ -5640,6 +5643,11 @@ zp_api_menu_request( response )
         afterwards would ask for a second one.
     */
     self.zp_menu_paused = undefined;
+
+    if ( zp_ui_press_seen( self ) )
+        return;
+
+    level.zp_ui_pressed_at = gettime();
 
     if ( response == "request_pause" )
         zp_api_request_pause( self );
@@ -5670,6 +5678,30 @@ zp_api_menu_request( response )
     travels -- a press that arrives twice is a press that arrives, since
     the first one to be served clears the other.
 */
+/*
+    One press, two roads, one serve. The host's own page writes
+    zp_ui_request and sends the menu response as well, so the same press can
+    arrive twice a tenth of a second apart. Served twice, a second press calls
+    off the round-end pause the first one armed, ends the personal pause it
+    started, and with zp_cooldown 0 resumes the pause it made. Whichever road
+    is served first stamps the time; the other road, for the host, within half
+    a second, is the same press and is dropped. A client's press only ever
+    arrives as a menu response -- their dvar is their own game's -- so nothing
+    of theirs is ever dropped.
+*/
+zp_ui_press_seen( player )
+{
+    if ( !isdefined( level.zp_ui_pressed_at ) )
+        return 0;
+
+    if ( gettime() - level.zp_ui_pressed_at > 500 )
+        return 0;
+
+    host = zp_host_player();
+
+    return !isdefined( player ) || ( isdefined( host ) && player == host );
+}
+
 zp_api_request_watcher()
 {
     level endon( "end_game" );
@@ -5689,6 +5721,11 @@ zp_api_request_watcher()
         // still one that has been answered, and a dvar left set would be
         // acted on again a tenth of a second later.
         setdvar( "zp_ui_request", "" );
+
+        if ( zp_ui_press_seen( undefined ) )
+            continue;
+
+        level.zp_ui_pressed_at = gettime();
 
         if ( asked == "pause" )
             zp_api_request_pause( undefined );
@@ -5712,10 +5749,13 @@ zp_ui_publisher()
 
     last = "0";
     last_menu = "0";
+    tick = 0;
 
     for (;;)
     {
         wait 0.5;
+
+        tick++;
 
         /*
             Whether opening the pause menu is itself the pause. It is what
@@ -5754,6 +5794,10 @@ zp_ui_publisher()
             last = now;
             setdvar( "zp_ui_paused", now );
         }
+
+        // And every player's own menu, the host's included: every fourth
+        // pass is a heartbeat, so two seconds is the most one can be behind.
+        zp_ui_tell_all( int( menu ), tick % 4 == 0 );
     }
 }
 
@@ -5765,6 +5809,70 @@ zp_ui_clear()
     setdvar( "zp_ui_paused", "0" );
     setdvar( "zp_ui_menu_pause", "0" );
     setdvar( "zp_ui_request", "" );
+
+    players = getplayers();
+
+    for ( i = 0; i < players.size; i++ )
+        players[ i ] zp_ui_tell( 0, 0, 0, 0, 1 );
+}
+
+/*
+    One player's view of the pause, for their own pause menu. A client's game
+    is not the server, so the dvars the publisher writes are the host's alone:
+    a player who is not the host learns the state from this instead, which is
+    what lets their pause menu carry PAUSE GAME too (1.7, Xep: the row is
+    everybody's, on the combo's rules). Four numbers: whether ZPause is
+    running, whether the game is paused for them - a personal pause included -
+    whether opening the menu is itself the pause, and whether zp_host_only
+    leaves them a pause to ask for at all.
+
+    The event name is a localized literal, the form stock zombies writes its
+    own in (&"score_event"), and init() precaches it: an event name nothing has
+    precached is a script error when it is sent. Black Ops III's copy declares
+    it with #precache( "eventstring", ... ) for the same reason.
+*/
+zp_ui_tell_all( menu, again )
+{
+    host = zp_host_player();
+    held = is_true( level.zp_paused ) || is_true( level.zp_pending );
+    only = isdefined( level.zp ) && is_true( level.zp.host_only );
+    personal = isdefined( level.zp ) && is_true( level.zp.personal_pause );
+    players = getplayers();
+
+    for ( i = 0; i < players.size; i++ )
+    {
+        player = players[ i ];
+
+        mine = 0;
+
+        if ( held || is_true( player.zp_personal ) )
+            mine = 1;
+
+        allowed = 1;
+
+        // As the combo decides it: a personal pause is every player's even
+        // with zp_host_only on, since it pauses nobody but them.
+        if ( only && !personal && isdefined( host ) && player != host )
+            allowed = 0;
+
+        player zp_ui_tell( 1, mine, menu, allowed, again );
+    }
+}
+
+/*
+    Sent when it changes for this player, and when asked to say it again: a
+    menu that missed one is never more than a heartbeat out of date.
+*/
+zp_ui_tell( active, paused, menu, allowed, again )
+{
+    said = "" + active + paused + menu + allowed;
+
+    if ( !again && isdefined( self.zp_ui_said ) && self.zp_ui_said == said )
+        return;
+
+    self.zp_ui_said = said;
+
+    self luinotifyevent( &"zpause_state", 4, active, paused, menu, allowed );
 }
 
 
@@ -5800,7 +5908,7 @@ zp_ui_clear()
 zp_version()
 {
     // ZP_VERSION_BEGIN
-    return "1.6";
+    return "1.7";
     // ZP_VERSION_END
 }
 

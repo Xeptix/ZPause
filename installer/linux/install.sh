@@ -234,7 +234,7 @@ name_of() {  # fill in REL_NAME / REL_VERSION from a folder name
     local leaf
     leaf="$(basename "${1:-}")"
     [ -n "$REL_VERSION" ] || REL_VERSION="$(printf '%s' "$leaf" |
-        sed -n 's/.*[ .]v\([0-9][0-9.]*d\?\)\([ .].*\)\{0,1\}$/\1/p')"
+        sed -n 's/.*[ .]v\([0-9][0-9.]*-snapshot\.[0-9][0-9]*\|[0-9][0-9.]*-early\.[0-9][0-9]*\|[0-9][0-9.]*d\?\)\([ .].*\)\{0,1\}$/\1/p')"
     [ -n "$REL_NAME" ] || REL_NAME="$(printf '%s' "$leaf" |
         sed 's/[ .]v[0-9].*$//; s/\./ /g')"
 }
@@ -294,13 +294,30 @@ DID_INSTALL=0
 LATEST_VERSION=""
 
 # ------------------------------------------------- version arithmetic
-# A public version is X.Y. A development build appends .N.d and is working
-# towards X.Y, so it sorts below the release of the same number.
-ver_key() {  # ver_key 1.4.2.d -> sortable string, empty if not a version
+# A public version is X.Y. A build being tested appends -snapshot.N (or
+# -early.N) and is working towards X.Y, so it sorts below the release of the
+# same number. The older .N.d shape means the same thing and is still read:
+# every build made before October 2026 carries it, and so does every copy of
+# one already installed, which this reads off disk to decide what to do.
+ver_key() {  # ver_key 1.7-snapshot.2 -> sortable string, empty if not a version
     case "${1:-}" in
+        # First, because [0-9]*.[0-9]* below matches these too: * is any run of
+        # characters, so 1.7-snapshot.1 satisfies it and would be read as 1.7.
+        # The minor number needs the suffix cut off it for the same reason.
+        [0-9]*.[0-9]*-snapshot.[0-9]*|[0-9]*.[0-9]*-early.[0-9]*)
+            printf '%05d %05d 0 %05d' "$(echo "$1" | cut -d. -f1)" \
+                   "$(echo "$1" | cut -d. -f2 | cut -d- -f1)" \
+                   "$(echo "$1" | sed 's/.*\.//')" ;;
         [0-9]*.[0-9]*.[0-9]*.d)
             printf '%05d %05d 0 %05d' "$(echo "$1" | cut -d. -f1)" \
                    "$(echo "$1" | cut -d. -f2)" "$(echo "$1" | cut -d. -f3)" ;;
+        # Anything with a character left in it that is neither a digit nor a dot
+        # is not a version. Without this, * in the glob below swallows a trailing
+        # anything: 1.7-bogus.1 read as the release 1.7, which is worse than
+        # unreadable, and printf complained about "7-bogus" on the way. The
+        # PowerShell twin anchors its patterns and always refused it, so this is
+        # what puts the two back in step.
+        *[!0-9.]*) printf '' ;;
         [0-9]*.[0-9]*)
             printf '%05d %05d 1 00000' "$(echo "$1" | cut -d. -f1)" \
                    "$(echo "$1" | cut -d. -f2)" ;;
@@ -925,7 +942,7 @@ slot_present() {  # slot_present <i> -- is that loader even installed?
 
 read_version() {  # read_version <file>
     [ -f "$1" ] || return 1
-    head -n 40 "$1" | sed -n 's/.*ZPAUSE\( T[0-9]\)\? v\([0-9][0-9.]*d\?\).*/\2/p' | head -n 1
+    head -n 40 "$1" | sed -n 's/.*ZPAUSE\( T[0-9]\)\? v\([0-9][0-9.]*-snapshot\.[0-9][0-9]*\|[0-9][0-9.]*-early\.[0-9][0-9]*\|[0-9][0-9.]*d\?\).*/\2/p' | head -n 1
 }
 
 slot_version() {  # slot_version <i> <full path> -> version, or nothing if absent
@@ -1159,7 +1176,7 @@ get_latest() {  # get_latest <repo> <asset prefix>
     # refused as labelled v5 by a script that says v1.5.
     LATEST_VERSION="$(printf '%s' "$json" |
         grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 |
-        sed -n 's/.*:[[:space:]]*"[^0-9"]*\([0-9][0-9.]*d\?\)".*/\1/p')"
+        sed -n 's/.*:[[:space:]]*"[^0-9"]*\([0-9][0-9.]*-snapshot\.[0-9][0-9]*\|[0-9][0-9.]*-early\.[0-9][0-9]*\|[0-9][0-9.]*d\?\)".*/\1/p')"
 
     urls="$(printf '%s' "$json" |
         grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' |
@@ -1203,7 +1220,7 @@ get_latest() {  # get_latest <repo> <asset prefix>
     [ -n "$LATEST_URL" ] || { say "That release has no zip attached to it."; return 1; }
     if [ -z "$LATEST_VERSION" ]; then
         LATEST_VERSION="$(printf '%s' "$LATEST_NAME" |
-            sed -n 's/.*[ .]v\([0-9][0-9.]*d\?\)[ .].*/\1/p')"
+            sed -n 's/.*[ .]v\([0-9][0-9.]*-snapshot\.[0-9][0-9]*\|[0-9][0-9.]*-early\.[0-9][0-9]*\|[0-9][0-9.]*d\?\)[ .].*/\1/p')"
     fi
 }
 
@@ -1306,7 +1323,7 @@ get_releases() {  # get_releases <repo> <asset prefix> -- the whole list
         base="$(basename "$u" | sed 's/%20/ /g; s/%5B/[/g; s/%5D/]/g')"
         case "$base" in *.zip) ;; *) continue ;; esac
         case "$(norm_name "$base")" in "$want"*) ;; *) continue ;; esac
-        v="$(printf '%s' "$base" | sed -n 's/.*[ .]v\([0-9][0-9.]*d\?\)[ .].*/\1/p')"
+        v="$(printf '%s' "$base" | sed -n 's/.*[ .]v\([0-9][0-9.]*-snapshot\.[0-9][0-9]*\|[0-9][0-9.]*-early\.[0-9][0-9]*\|[0-9][0-9.]*d\?\)[ .].*/\1/p')"
         GHV+=("$v"); GHU+=("$u"); GHN+=("$base")
     done <<< "$urls"
     [ "${#GHU[@]}" -gt 0 ]
@@ -1715,8 +1732,8 @@ pick_zbundle() {  # pick_zbundle <key> -- sets PICKED for the ZBundle slots
     if [ "$ASSUME_YES" -eq 0 ] && [ "$NO_ZBUNDLE" -eq 0 ]; then
         [ -n "$zs" ] && zs=" v$zs"
         blank
-        say "This download also carries ZBundle: ZPause and ZShare$zs as one mod,"
-        say "for playing both from the Mods menu. It goes in mods/zm_zbundle, beside"
+        say "This download also carries ZBundle: ZPause, ZShare, ZStats and ZTweaks as one mod,"
+        say "for playing them together from the Mods menu. It goes in mods/zm_zbundle, beside"
         say "zm_pause, and does nothing until you pick zm_zbundle there."
         d="n"; [ "$want" -eq 1 ] && d="y"
         if ask "Install ZBundle as well?" "$d"; then want=1; else want=0; fi
