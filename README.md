@@ -834,6 +834,12 @@ say yes to the merge, and delete the game folders you don't have.
 
 ## Changelog
 
+### v1.8
+
+- **No change on this port.** 1.8 fixes the Black Ops III settings screen's category strip; Black
+  Ops II's already stays in place. The version moves with the others so the same number means the
+  same release everywhere.
+
 ### v1.7
 
 - **PAUSE GAME is every player's.** The row in the game's own pause menu was the host's
